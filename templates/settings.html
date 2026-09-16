@@ -152,6 +152,8 @@
                     <div>
                         <label class="block text-gray-400 text-xs sm:text-sm mb-2 uppercase font-bold tracking-wider">Resume After</label>
                         <select x-model="form.capital_extractor.resume_after" class="w-full bg-gray-700 border-none rounded-lg p-3 text-white focus:ring-2 focus:ring-blue-500 transition">
+                            <option value="flat">Once position is flat (standard 30s)</option>
+                            <option value="next_window">Wait for next 15m market window</option>
                             <option value="submitted">Transaction submitted (faster)</option>
                             <option value="confirmed">Confirmed on-chain (safer)</option>
                         </select>
@@ -168,7 +170,7 @@
                     <input type="checkbox" x-model="form.telegram.enabled" class="w-4 h-4">
                     <span class="text-sm font-bold text-sky-400 uppercase">Send Telegram alerts on withdrawal</span>
                 </label>
-                <div class="grid grid-cols-1 md:grid-cols-2 gap-4 sm:gap-6" :class="form.telegram.enabled ? '' : 'opacity-50 pointer-events-none'">
+                <div class="grid grid-cols-1 md:grid-cols-2 gap-4 sm:gap-6">
                     <div class="md:col-span-2">
                         <label class="block text-gray-400 text-xs sm:text-sm mb-2 uppercase font-bold tracking-wider">Bot Token</label>
                         <div class="flex flex-col sm:flex-row gap-2">
@@ -450,18 +452,22 @@
                 async testTelegram() {
                     this.tgBusy = true; this.tgResult = '';
                     try {
-                        const res = await fetch('/api/test-telegram', { method: 'POST' });
+                        const res = await fetch('/api/test-telegram', {
+                            method: 'POST',
+                            headers: { 'Content-Type': 'application/json' },
+                            body: JSON.stringify({ bot_token: this.form.telegram.bot_token })
+                        });
                         const data = await res.json();
                         this.tgOk = !!data.ok;
-                        this.tgResult = data.ok
+                        this.tgResult = data.message || (data.ok
                             ? `Test alert sent to ${data.count} subscriber(s).`
-                            : `Failed: ${data.error || 'unknown'}`;
+                            : `Failed: ${data.error || 'unknown'}`);
                     } catch (e) {
                         this.tgOk = false;
                         this.tgResult = 'Test request failed.';
                     }
                     this.tgBusy = false;
-                    setTimeout(() => this.tgResult = '', 8000);
+                    setTimeout(() => this.tgResult = '', 10000);
                 },
                 async saveSettings() {
                     try {

@@ -206,7 +206,7 @@
                          The count comes from Polymarket's positions API for the funded wallet,
                          so it includes failed auto-redeems and excludes anything already
                          redeemed elsewhere. Hidden only when there is no wallet at all. -->
-                    <div x-show="redeem.has_key || redeem.count > 0"
+                    <div x-show="data.trading_state?.mode === 'live' && (redeem.has_key || redeem.count > 0)"
                          class="mb-4 p-3 rounded-lg border"
                          :class="redeem.count > 0 ? 'bg-emerald-900/20 border-emerald-700/60' : 'bg-gray-900/40 border-gray-700'">
                         <div class="flex flex-col sm:flex-row sm:items-center gap-3">
@@ -291,7 +291,7 @@
                                 </tr>
                             </thead>
                             <tbody class="text-[11px] sm:text-sm">
-                                <template x-for="trade in data.trading_state?.active_trades" :key="trade.market_id">
+                                <template x-for="trade in data.trading_state?.active_trades" :key="trade.trade_id || trade.order_id || (trade.market_id + '_' + trade.entry_time)">
                                     <tr class="border-t border-gray-700 hover:bg-gray-700/30 transition">
                                         <td class="px-4 py-3 truncate max-w-[150px] sm:max-w-[200px]" x-text="trade.market_slug"></td>
                                         <td class="px-4 py-3 font-bold" :class="trade.side === 'UP' ? 'text-green-400' : 'text-red-400'" x-text="trade.side"></td>

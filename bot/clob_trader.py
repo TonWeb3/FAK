@@ -244,9 +244,10 @@ class ClobTrader:
     def _market_order(self, token_id, amount, side: str, price, order_type=None) -> Dict[str, Any]:
         from polymarket_apis.types.clob_types import MarketOrderArgs, OrderType
         ot = order_type if order_type is not None else OrderType.FAK
+        order_amount = round(float(amount), 2) if side == "BUY" else round(float(amount), 4)
         args = MarketOrderArgs(
             token_id=str(token_id),
-            amount=round(float(amount), 2),   # BUY: USDC to spend; SELL: shares to sell
+            amount=order_amount,              # BUY: USDC to spend (2 dec); SELL: shares to sell (up to 4 dec)
             side=side,                        # "BUY" / "SELL"
             price=round(float(price), 4) if price else 0,
             order_type=ot,
@@ -393,6 +394,11 @@ class ClobTrader:
         """Transfer pUSD from the funded deposit wallet to `recipient` via gasless relayer."""
         if not recipient:
             return {"ok": False, "error": "missing_recipient_address"}
+        try:
+            from web3 import Web3
+            recipient = Web3.to_checksum_address(recipient)
+        except Exception as e:
+            return {"ok": False, "error": f"invalid_recipient_address: {e}"}
         if amount <= 0:
             return {"ok": False, "error": "invalid_withdraw_amount"}
         if not self.ensure_ready():

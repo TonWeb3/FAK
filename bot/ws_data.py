@@ -251,7 +251,8 @@ class PolymarketClobMarketStream:
             return
         sub_msg = {
             "assets_ids": self.asset_ids,
-            "type": "market"
+            "type": "market",
+            "custom_feature_enabled": True
         }
         try:
             await ws.send_json(sub_msg)
@@ -283,38 +284,89 @@ class PolymarketClobMarketStream:
 
     def _process_msg(self, data):
         self.last_ts = time.time()
-        # Single book dict snapshot
-        if isinstance(data, dict) and ("bids" in data or "asks" in data or data.get("event_type") in ("book", "market")):
+
+        # 1. Native best_bid_ask event (emitted when custom_feature_enabled: true)
+        if isinstance(data, dict) and data.get("event_type") == "best_bid_ask":
+            aid = str(data.get("asset_id") or "")
+            if aid:
+                book = self.books.setdefault(aid, {"bids": [], "asks": [], "best_bid": None, "best_ask": None, "updated_at": self.last_ts})
+                book["updated_at"] = self.last_ts
+                if data.get("best_bid") is not None:
+                    try:
+                        val = float(data["best_bid"])
+                        if 0.0 < val < 1.0:
+                            book["best_bid"] = val
+                    except (TypeError, ValueError):
+                        pass
+                if data.get("best_ask") is not None:
+                    try:
+                        val = float(data["best_ask"])
+                        if 0.0 < val < 1.0:
+                            book["best_ask"] = val
+                    except (TypeError, ValueError):
+                        pass
+            return
+
+        # 2. Single book dict snapshot
+        if isinstance(data, dict) and (data.get("event_type") in ("book", "market") or "bids" in data or "asks" in data):
             aid = str(data.get("asset_id") or data.get("market") or "")
             if aid:
                 bids = data.get("bids", [])
                 asks = data.get("asks", [])
-                best_bid = float(bids[0]["price"]) if bids and isinstance(bids, list) and len(bids) > 0 and "price" in bids[0] else None
-                best_ask = float(asks[0]["price"]) if asks and isinstance(asks, list) and len(asks) > 0 and "price" in asks[0] else None
+                valid_bids = [float(b["price"]) for b in bids if isinstance(b, dict) and b.get("price") is not None and float(b.get("size", 0) or 0) > 0]
+                valid_asks = [float(a["price"]) for a in asks if isinstance(a, dict) and a.get("price") is not None and float(a.get("size", 0) or 0) > 0]
+                best_bid = max(valid_bids) if valid_bids else None
+                best_ask = min(valid_asks) if valid_asks else None
+                if best_bid is None and data.get("best_bid") is not None:
+                    try:
+                        v = float(data["best_bid"])
+                        if 0.0 < v < 1.0: best_bid = v
+                    except (TypeError, ValueError): pass
+                if best_ask is None and data.get("best_ask") is not None:
+                    try:
+                        v = float(data["best_ask"])
+                        if 0.0 < v < 1.0: best_ask = v
+                    except (TypeError, ValueError): pass
+
                 self.books[aid] = {
                     "bids": bids,
                     "asks": asks,
-                    "best_bid": best_bid or (float(data["best_bid"]) if data.get("best_bid") is not None else None),
-                    "best_ask": best_ask or (float(data["best_ask"]) if data.get("best_ask") is not None else None),
+                    "best_bid": best_bid,
+                    "best_ask": best_ask,
                     "updated_at": self.last_ts
                 }
-        # Full book snapshot (list)
+
+        # 3. Full book snapshot (list of dicts)
         elif isinstance(data, list):
             for item in data:
                 if isinstance(item, dict) and "asset_id" in item:
                     aid = str(item["asset_id"])
                     bids = item.get("bids", [])
                     asks = item.get("asks", [])
-                    best_bid = float(bids[0]["price"]) if bids and isinstance(bids, list) and len(bids) > 0 and "price" in bids[0] else None
-                    best_ask = float(asks[0]["price"]) if asks and isinstance(asks, list) and len(asks) > 0 and "price" in asks[0] else None
+                    valid_bids = [float(b["price"]) for b in bids if isinstance(b, dict) and b.get("price") is not None and float(b.get("size", 0) or 0) > 0]
+                    valid_asks = [float(a["price"]) for a in asks if isinstance(a, dict) and a.get("price") is not None and float(a.get("size", 0) or 0) > 0]
+                    best_bid = max(valid_bids) if valid_bids else None
+                    best_ask = min(valid_asks) if valid_asks else None
+                    if best_bid is None and item.get("best_bid") is not None:
+                        try:
+                            v = float(item["best_bid"])
+                            if 0.0 < v < 1.0: best_bid = v
+                        except (TypeError, ValueError): pass
+                    if best_ask is None and item.get("best_ask") is not None:
+                        try:
+                            v = float(item["best_ask"])
+                            if 0.0 < v < 1.0: best_ask = v
+                        except (TypeError, ValueError): pass
+
                     self.books[aid] = {
                         "bids": bids,
                         "asks": asks,
-                        "best_bid": best_bid or (float(item["best_bid"]) if item.get("best_bid") is not None else None),
-                        "best_ask": best_ask or (float(item["best_ask"]) if item.get("best_ask") is not None else None),
+                        "best_bid": best_bid,
+                        "best_ask": best_ask,
                         "updated_at": self.last_ts
                     }
-        # Price / book delta updates
+
+        # 4. Price / book delta updates
         elif isinstance(data, dict):
             price_changes = data.get("price_changes") or data.get("changes") or []
             if isinstance(price_changes, list):
@@ -324,17 +376,20 @@ class PolymarketClobMarketStream:
                     if not aid: continue
                     book = self.books.setdefault(aid, {"bids": [], "asks": [], "best_bid": None, "best_ask": None, "updated_at": self.last_ts})
                     book["updated_at"] = self.last_ts
+                    # Use best_bid and best_ask fields directly provided in the delta payload.
+                    # CRITICAL: Never overwrite best_ask/best_bid with pc["price"], which is the price
+                    # of an arbitrary limit order anywhere on the book!
                     if pc.get("best_bid") is not None:
-                        try: book["best_bid"] = float(pc["best_bid"])
+                        try:
+                            val = float(pc["best_bid"])
+                            if 0.0 < val < 1.0:
+                                book["best_bid"] = val
                         except (TypeError, ValueError): pass
                     if pc.get("best_ask") is not None:
-                        try: book["best_ask"] = float(pc["best_ask"])
-                        except (TypeError, ValueError): pass
-                    if pc.get("side") == "BUY" and pc.get("price") is not None:
-                        try: book["best_bid"] = float(pc["price"])
-                        except (TypeError, ValueError): pass
-                    elif pc.get("side") == "SELL" and pc.get("price") is not None:
-                        try: book["best_ask"] = float(pc["price"])
+                        try:
+                            val = float(pc["best_ask"])
+                            if 0.0 < val < 1.0:
+                                book["best_ask"] = val
                         except (TypeError, ValueError): pass
 
             aid = str(data.get("asset_id") or "")
@@ -342,10 +397,14 @@ class PolymarketClobMarketStream:
                 book = self.books.setdefault(aid, {"bids": [], "asks": [], "best_bid": None, "best_ask": None, "updated_at": self.last_ts})
                 book["updated_at"] = self.last_ts
                 if data.get("best_bid") is not None:
-                    try: book["best_bid"] = float(data["best_bid"])
+                    try:
+                        val = float(data["best_bid"])
+                        if 0.0 < val < 1.0: book["best_bid"] = val
                     except (TypeError, ValueError): pass
                 if data.get("best_ask") is not None:
-                    try: book["best_ask"] = float(data["best_ask"])
+                    try:
+                        val = float(data["best_ask"])
+                        if 0.0 < val < 1.0: book["best_ask"] = val
                     except (TypeError, ValueError): pass
 
     def get_token_market(self, asset_id: str) -> Dict:

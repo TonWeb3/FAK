@@ -211,7 +211,7 @@ async def fetch_redeemable_positions(funder_address: str) -> List[Dict]:
     if not funder_address:
         return []
     url = "https://data-api.polymarket.com/positions"
-    params = {"user": funder_address, "sizeThreshold": "0.01"}
+    params = {"user": funder_address, "sizeThreshold": "0.01", "redeemable": "true"}
     proxy = get_proxy_url_for(url)
     try:
         async with httpx.AsyncClient(proxy=proxy if proxy else None, timeout=10.0) as client:

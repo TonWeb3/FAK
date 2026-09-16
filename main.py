@@ -37,7 +37,18 @@ MARK_CAPTURE_WINDOW_MS = 20_000
 
 _market_event = asyncio.Event()
 _entry_lock = asyncio.Lock()
+_trade_lock = asyncio.Lock()
+_in_flight_markets = set()
 _last_eval_ts = 0.0
+
+def _sync_active_trades_to_latest_data():
+    if "trading_state" in state.get("latest_data", {}):
+        ts = state["latest_data"]["trading_state"]
+        ts["active_trades"] = list(state["active_trades"])
+        open_val = sum(float(t.get("shares", 0.0)) * (float(t.get("mark_price") or t.get("entry_price") or 0.0)) for t in state["active_trades"])
+        ts["open_value"] = open_val
+        ts["equity"] = state["paper_balance"] + open_val
+        ts["balance"] = state["paper_balance"]
 
 def _wake_entry(data_payload=None):
     _market_event.set()
@@ -131,16 +142,48 @@ def load_state():
         print(f"Error loading state: {e}")
 
 # ── Telegram notifications & poller ───────────────────────────────────────────
-def load_telegram_subscribers() -> List[int]:
+def _normalize_subscriber(s: Any) -> Optional[Dict[str, Any]]:
+    if isinstance(s, dict):
+        cid = s.get("chat_id")
+        if cid is not None:
+            try:
+                return {
+                    "chat_id": int(cid),
+                    "name": str(s.get("name") or f"Chat {cid}"),
+                    "type": str(s.get("type") or "chat"),
+                    "subscribed_at": s.get("subscribed_at")
+                }
+            except (ValueError, TypeError):
+                return None
+    elif isinstance(s, (int, str)):
+        try:
+            cid = int(s)
+            return {
+                "chat_id": cid,
+                "name": f"Chat {cid}",
+                "type": "chat",
+                "subscribed_at": None
+            }
+        except (ValueError, TypeError):
+            return None
+    return None
+
+def load_telegram_subscribers() -> List[Dict[str, Any]]:
     try:
         if os.path.exists(TELEGRAM_SUBS_PATH):
             with open(TELEGRAM_SUBS_PATH, "r") as f:
                 subs = json.load(f)
                 if isinstance(subs, list):
-                    state["telegram_subscribers"] = [int(s) for s in subs]
+                    normalized = []
+                    for s in subs:
+                        norm = _normalize_subscriber(s)
+                        if norm and not any(x["chat_id"] == norm["chat_id"] for x in normalized):
+                            normalized.append(norm)
+                    state["telegram_subscribers"] = normalized
                     return state["telegram_subscribers"]
     except Exception as e:
         print(f"Error loading telegram subscribers: {e}")
+    state["telegram_subscribers"] = []
     return []
 
 def save_telegram_subscribers():
@@ -150,35 +193,52 @@ def save_telegram_subscribers():
     except Exception as e:
         print(f"Error saving telegram subscribers: {e}")
 
-def add_telegram_subscriber(chat_id: int):
-    if chat_id not in state["telegram_subscribers"]:
-        state["telegram_subscribers"].append(chat_id)
-        save_telegram_subscribers()
+def add_telegram_subscriber(chat_id: int, name: str = "", chat_type: str = "chat"):
+    subs = state["telegram_subscribers"]
+    for s in subs:
+        if s.get("chat_id") == chat_id:
+            if name and name != f"Chat {chat_id}":
+                s["name"] = name
+            if chat_type:
+                s["type"] = chat_type
+            save_telegram_subscribers()
+            return
+    subs.append({
+        "chat_id": chat_id,
+        "name": name or f"Chat {chat_id}",
+        "type": chat_type or "chat",
+        "subscribed_at": datetime.now().isoformat()
+    })
+    save_telegram_subscribers()
 
 def remove_telegram_subscriber(chat_id: int):
-    if chat_id in state["telegram_subscribers"]:
-        state["telegram_subscribers"].remove(chat_id)
-        save_telegram_subscribers()
+    subs = state["telegram_subscribers"]
+    state["telegram_subscribers"] = [s for s in subs if s.get("chat_id") != chat_id]
+    save_telegram_subscribers()
 
 async def send_telegram(text: str):
     if not settings.TELEGRAM_ENABLED or not settings.TELEGRAM_BOT_TOKEN:
         return
-    subs = state["telegram_subscribers"]
+    subs = state.get("telegram_subscribers", [])
     if not subs:
         return
     url = f"https://api.telegram.org/bot{settings.TELEGRAM_BOT_TOKEN}/sendMessage"
     proxy = ws_data.get_proxy_url_for(url)
-    for chat_id in subs:
+    for sub in subs:
+        chat_id = sub.get("chat_id") if isinstance(sub, dict) else sub
+        if not chat_id:
+            continue
         try:
             async with httpx.AsyncClient(proxy=proxy if proxy else None, timeout=5.0) as client:
                 await client.post(url, json={"chat_id": chat_id, "text": text, "parse_mode": "Markdown"})
         except Exception as e:
             print(f"Failed to send telegram to {chat_id}: {e}")
 
-async def send_telegram_to(chat_id: int, text: str):
-    if not settings.TELEGRAM_BOT_TOKEN:
+async def send_telegram_to(chat_id: int, text: str, bot_token: Optional[str] = None):
+    tok = bot_token or settings.TELEGRAM_BOT_TOKEN
+    if not tok:
         return
-    url = f"https://api.telegram.org/bot{settings.TELEGRAM_BOT_TOKEN}/sendMessage"
+    url = f"https://api.telegram.org/bot{tok}/sendMessage"
     proxy = ws_data.get_proxy_url_for(url)
     try:
         async with httpx.AsyncClient(proxy=proxy if proxy else None, timeout=5.0) as client:
@@ -189,11 +249,12 @@ async def send_telegram_to(chat_id: int, text: str):
 async def telegram_poller():
     offset = 0
     while True:
-        if not settings.TELEGRAM_ENABLED or not settings.TELEGRAM_BOT_TOKEN:
+        tok = settings.TELEGRAM_BOT_TOKEN
+        if not tok:
             await asyncio.sleep(5)
             continue
         try:
-            url = f"https://api.telegram.org/bot{settings.TELEGRAM_BOT_TOKEN}/getUpdates"
+            url = f"https://api.telegram.org/bot{tok}/getUpdates"
             proxy = ws_data.get_proxy_url_for(url)
             async with httpx.AsyncClient(proxy=proxy if proxy else None, timeout=10.0) as client:
                 resp = await client.get(url, params={"offset": offset, "timeout": 5})
@@ -201,33 +262,46 @@ async def telegram_poller():
                     data_updates = resp.json().get("result", [])
                     for update in data_updates:
                         offset = max(offset, update.get("update_id", 0) + 1)
-                        msg = update.get("message", {})
+                        msg = update.get("message") or update.get("channel_post") or {}
                         chat = msg.get("chat", {})
                         chat_id = chat.get("id")
-                        text = (msg.get("text") or "").strip()
-                        if not chat_id or not text:
+                        if not chat_id:
                             continue
+                        chat_type = chat.get("type", "chat")
+                        first_name = chat.get("first_name", "")
+                        last_name = chat.get("last_name", "")
+                        username = chat.get("username", "")
+                        title = chat.get("title", "")
+                        name = title or f"{first_name} {last_name}".strip() or (f"@{username}" if username else f"Chat {chat_id}")
+                        text = (msg.get("text") or "").strip()
                         
-                        cmd = text.split()[0].lower()
-                        if cmd == "/start":
-                            add_telegram_subscriber(chat_id)
-                            await send_telegram_to(chat_id, "🤖 *Subscribed to 15m Polymarket Bot alerts!* Use /status or /balance to check current status.")
-                        elif cmd == "/stop":
+                        cmd = text.split()[0].lower() if text else ""
+                        if cmd == "/stop":
                             remove_telegram_subscriber(chat_id)
-                            await send_telegram_to(chat_id, "👋 *Unsubscribed from alerts.*")
+                            await send_telegram_to(chat_id, "👋 *Unsubscribed from alerts.*", bot_token=tok)
                         elif cmd == "/status":
+                            add_telegram_subscriber(chat_id, name, chat_type)
                             mode = state["trading_mode"].upper()
                             running = "🟢 RUNNING" if state["running"] else "🔴 STOPPED"
                             bal = state["paper_balance"]
                             active_cnt = len(state["active_trades"])
                             msg_txt = f"📊 *Bot Status*\n• Status: {running}\n• Mode: {mode}\n• Balance: `${bal:.2f}`\n• Active Trades: `{active_cnt}`"
-                            await send_telegram_to(chat_id, msg_txt)
+                            await send_telegram_to(chat_id, msg_txt, bot_token=tok)
                         elif cmd == "/balance":
+                            add_telegram_subscriber(chat_id, name, chat_type)
                             bal = state["paper_balance"]
                             funder = clob_trader.get_funder() or "N/A"
-                            await send_telegram_to(chat_id, f"💰 *Current Balance*\n• Balance: `${bal:.2f}`\n• Wallet: `{funder}`")
+                            await send_telegram_to(chat_id, f"💰 *Current Balance*\n• Balance: `${bal:.2f}`\n• Wallet: `{funder}`", bot_token=tok)
                         elif cmd == "/help":
-                            await send_telegram_to(chat_id, "ℹ️ *Commands*\n/start - Subscribe\n/stop - Unsubscribe\n/status - Bot status\n/balance - Wallet balance")
+                            add_telegram_subscriber(chat_id, name, chat_type)
+                            await send_telegram_to(chat_id, "ℹ️ *Commands*\n/start - Subscribe\n/stop - Unsubscribe\n/status - Bot status\n/balance - Wallet balance", bot_token=tok)
+                        else:
+                            add_telegram_subscriber(chat_id, name, chat_type)
+                            if cmd == "/start":
+                                await send_telegram_to(chat_id, "🤖 *Subscribed to 15m Polymarket Bot alerts!* Use /status or /balance to check current status.", bot_token=tok)
+                elif resp.status_code == 401:
+                    await asyncio.sleep(30)
+                    continue
         except Exception:
             pass
         await asyncio.sleep(2)
@@ -407,116 +481,139 @@ async def execute_trade(decision: Dict[str, Any], market_prices: Dict[str, Any],
     if decision["action"] != "ENTER":
         return decision.get("reason", "no_trade")
 
-    # CONSTRAINT: Only one position per market window — do NOT block entering a new window while an old one is resolving
-    cur_mkt_id = str(market.get("id"))
-    if any(str(t.get("market_id")) == cur_mkt_id for t in state["active_trades"]):
-        return "slot_busy"
+    cur_mkt_id = str(market.get("id") or "")
+    cur_slug = str(market.get("slug") or "")
 
-    if state["withdraw_state"] == "in_progress":
-        return "withdraw_in_progress"
+    async with _trade_lock:
+        if cur_mkt_id and cur_mkt_id in _in_flight_markets:
+            return "slot_busy"
 
-    if strike_open is None:
-        return "no_strike"
+        # CONSTRAINT: Only one position per market window — prevent duplicate entries
+        for t in state["active_trades"]:
+            if cur_mkt_id and str(t.get("market_id")) == cur_mkt_id:
+                return "slot_busy"
+            if cur_slug and t.get("market_slug") == cur_slug:
+                return "slot_busy"
+            if window_start_ms is not None and t.get("window_start_ms") == int(window_start_ms):
+                return "slot_busy"
 
-    side = decision["side"]
-    price = market_prices["up"] if side == "UP" else market_prices["down"]
-    if price is None:
-        return "no_price"
+        if state["withdraw_state"] == "in_progress":
+            return "withdraw_in_progress"
 
-    balance = state["paper_balance"]
-    risk_type = (settings.RISK_TYPE or "percent").lower()
-    if risk_type == "fixed":
-        amount_to_risk = float(settings.RISK_VALUE)
-    else:
-        amount_to_risk = (float(settings.RISK_VALUE) / 100.0) * balance
+        if strike_open is None:
+            return "no_strike"
 
-    if amount_to_risk <= 0:
-        return "stake_zero"
+        side = decision["side"]
+        price = market_prices["up"] if side == "UP" else market_prices["down"]
+        if price is None:
+            return "no_price"
 
-    ob = (orderbook or {}).get("up" if side == "UP" else "down") or {}
-    ask_liq_shares = ob.get("askLiquidity")
-    if ask_liq_shares is not None and price > 0:
-        ask_liq_usd = ask_liq_shares * price
-        if ask_liq_usd < settings.MIN_BOOK_LIQUIDITY_USD:
-            log_message(f"Skip {side}: thin book (${ask_liq_usd:.2f} ask liquidity)")
-            return "thin_book"
-        amount_to_risk = min(amount_to_risk, ask_liq_usd)
-
-    if balance < amount_to_risk or amount_to_risk <= 0:
-        print(f"Insufficient balance ({balance}) or invalid risk amount ({amount_to_risk})")
-        return "insufficient_balance"
-
-    end_date_str = market.get("endDate")
-    end_ts = 0
-    if end_date_str:
-        try:
-            end_ts = datetime.fromisoformat(end_date_str.replace('Z', '+00:00')).timestamp()
-        except Exception:
-            pass
-    if not end_ts:
-        end_ts = time.time() + settings.CANDLE_WINDOW_MINUTES * 60
-
-    trade = {
-        "market_id": market["id"],
-        "market_slug": market.get("slug"),
-        "side": side,
-        "entry_price": price,
-        "amount": amount_to_risk,
-        "shares": amount_to_risk / price,
-        "entry_time": datetime.now().isoformat(),
-        "status": "OPEN",
-        "settlement_price": None,
-        "profit_loss": None,
-        "strike_price": strike_open,
-        "strike_source": strike_source,
-        "window_start_ms": int(window_start_ms) if window_start_ms is not None else None,
-        "open_reason": open_reason,
-        "close_price": None,
-        "end_ts": end_ts,
-        "mode": state["trading_mode"]
-    }
-
-    if state["trading_mode"] == "paper":
-        state["paper_balance"] -= amount_to_risk
-        state["active_trades"].append(trade)
-        state["last_trade_side"] = side
-        save_state()
-
-        msg = f"Executed PAPER trade: {side} @ {price:.4f} for {market.get('slug')} (Amount: ${amount_to_risk:.2f})"
-        log_message(msg)
-        await send_telegram(f"🟢 *PAPER Trade Entered*\n• Side: `{side}`\n• Price: `{price:.4f}`\n• Stake: `${amount_to_risk:.2f}`\n• Market: `{market.get('slug')}`")
-        return "entered"
-    else:
-        token_id = token_ids.get("up") if side == "UP" else token_ids.get("down")
-        if not token_id:
-            log_message(f"LIVE trade aborted: missing token_id for side {side}")
-            return "missing_token_id"
-
-        result = await asyncio.to_thread(clob_trader.place_market_buy, token_id, amount_to_risk, price)
-        if result.get("ok"):
-            trade["order_id"] = result.get("order_id")
-            trade["order_response"] = result.get("response") or {}
-            trade["token_id"] = token_id
-            fill_size = result.get("fill_size")
-            fill_price = result.get("fill_price")
-            fill_usd = result.get("fill_usd")
-            if fill_size and fill_price:
-                trade["shares"] = float(fill_size)
-                trade["entry_price"] = float(fill_price)
-                trade["amount"] = float(fill_usd if fill_usd else fill_size * fill_price)
-                trade["quoted_price"] = price
-                trade["slippage"] = float(fill_price) - float(price) if price else None
-            state["active_trades"].append(trade)
-            state["last_trade_side"] = side
-            save_state()
-            msg = (f"Executed LIVE trade [FAK]: {side} ${trade['amount']:.2f} on {market.get('slug')} "
-                   f"— {trade['shares']:.2f} shares @ {trade['entry_price']:.4f} (quote {price}, order {trade['order_id']})")
-            log_message(msg)
-            await send_telegram(f"🚀 *LIVE Trade Entered [FAK]*\n• Side: `{side}`\n• Price: `{trade['entry_price']:.4f}`\n• Shares: `{trade['shares']:.2f}`\n• Amount: `${trade['amount']:.2f}`\n• Market: `{market.get('slug')}`")
-            return "entered"
+        balance = state["paper_balance"]
+        risk_type = (settings.RISK_TYPE or "percent").lower()
+        if risk_type == "fixed":
+            amount_to_risk = float(settings.RISK_VALUE)
         else:
-            log_message(f"LIVE trade FAILED ({side}): {result.get('error')}")
-            return "live_order_failed"
+            amount_to_risk = (float(settings.RISK_VALUE) / 100.0) * balance
+
+        if amount_to_risk <= 0:
+            return "stake_zero"
+
+        ob = (orderbook or {}).get("up" if side == "UP" else "down") or {}
+        ask_liq_shares = ob.get("askLiquidity")
+        if ask_liq_shares is not None and price > 0:
+            ask_liq_usd = ask_liq_shares * price
+            if ask_liq_usd < settings.MIN_BOOK_LIQUIDITY_USD:
+                log_message(f"Skip {side}: thin book (${ask_liq_usd:.2f} ask liquidity)")
+                return "thin_book"
+            amount_to_risk = min(amount_to_risk, ask_liq_usd)
+
+        if balance < amount_to_risk or amount_to_risk <= 0:
+            print(f"Insufficient balance ({balance}) or invalid risk amount ({amount_to_risk})")
+            return "insufficient_balance"
+
+        end_date_str = market.get("endDate")
+        end_ts = 0
+        if end_date_str:
+            try:
+                end_ts = datetime.fromisoformat(end_date_str.replace('Z', '+00:00')).timestamp()
+            except Exception:
+                pass
+        if not end_ts:
+            end_ts = time.time() + settings.CANDLE_WINDOW_MINUTES * 60
+
+        trade_id = f"{cur_mkt_id}_{int(time.time() * 1000)}"
+        trade = {
+            "trade_id": trade_id,
+            "market_id": market["id"],
+            "market_slug": market.get("slug"),
+            "side": side,
+            "entry_price": price,
+            "amount": amount_to_risk,
+            "shares": amount_to_risk / price,
+            "entry_time": datetime.now().isoformat(),
+            "status": "OPEN",
+            "awaiting_resolution": False,
+            "settlement_price": None,
+            "profit_loss": None,
+            "strike_price": strike_open,
+            "strike_source": strike_source,
+            "window_start_ms": int(window_start_ms) if window_start_ms is not None else None,
+            "open_reason": open_reason,
+            "close_price": None,
+            "end_ts": end_ts,
+            "mode": state["trading_mode"]
+        }
+
+        if cur_mkt_id:
+            _in_flight_markets.add(cur_mkt_id)
+
+        try:
+            if state["trading_mode"] == "paper":
+                state["paper_balance"] -= amount_to_risk
+                state["active_trades"].append(trade)
+                state["last_trade_side"] = side
+                save_state()
+                _sync_active_trades_to_latest_data()
+
+                msg = f"Executed PAPER trade: {side} @ {price:.4f} for {market.get('slug')} (Amount: ${amount_to_risk:.2f})"
+                log_message(msg)
+                await send_telegram(f"🟢 *PAPER Trade Entered*\n• Side: `{side}`\n• Price: `{price:.4f}`\n• Stake: `${amount_to_risk:.2f}`\n• Market: `{market.get('slug')}`")
+                return "entered"
+            else:
+                token_id = token_ids.get("up") if side == "UP" else token_ids.get("down")
+                if not token_id:
+                    log_message(f"LIVE trade aborted: missing token_id for side {side}")
+                    return "missing_token_id"
+
+                result = await asyncio.to_thread(clob_trader.place_market_buy, token_id, amount_to_risk, price)
+                if result.get("ok"):
+                    trade["order_id"] = result.get("order_id")
+                    trade["order_response"] = result.get("response") or {}
+                    trade["token_id"] = token_id
+                    fill_size = result.get("fill_size")
+                    fill_price = result.get("fill_price")
+                    fill_usd = result.get("fill_usd")
+                    if fill_size and fill_price:
+                        trade["shares"] = float(fill_size)
+                        trade["entry_price"] = float(fill_price)
+                        trade["amount"] = float(fill_usd if fill_usd else fill_size * fill_price)
+                        trade["quoted_price"] = price
+                        trade["slippage"] = float(fill_price) - float(price) if price else None
+                    state["active_trades"].append(trade)
+                    state["last_trade_side"] = side
+                    save_state()
+                    _sync_active_trades_to_latest_data()
+                    msg = (f"Executed LIVE trade [FAK]: {side} ${trade['amount']:.2f} on {market.get('slug')} "
+                           f"— {trade['shares']:.2f} shares @ {trade['entry_price']:.4f} (quote {price}, order {trade['order_id']})")
+                    log_message(msg)
+                    await send_telegram(f"🚀 *LIVE Trade Entered [FAK]*\n• Side: `{side}`\n• Price: `{trade['entry_price']:.4f}`\n• Shares: `{trade['shares']:.2f}`\n• Amount: `${trade['amount']:.2f}`\n• Market: `{market.get('slug')}`")
+                    return "entered"
+                else:
+                    log_message(f"LIVE trade FAILED ({side}): {result.get('error')}")
+                    return "live_order_failed"
+        finally:
+            if cur_mkt_id:
+                _in_flight_markets.discard(cur_mkt_id)
 
 async def maybe_flip_position(decision: Dict[str, Any], poly_snapshot: Dict[str, Any], time_left_min: Optional[float]):
     if not settings.FLIP_ENABLED:
@@ -574,6 +671,7 @@ async def maybe_flip_position(decision: Dict[str, Any], poly_snapshot: Dict[str,
     state["active_trades"] = [t for t in state["active_trades"] if t is not trade]
     state["last_trade_side"] = None
     save_state()
+    _sync_active_trades_to_latest_data()
     log_message(f"FLIP: closed {trade['side']} @ {exit_price:.2f} (P/L ${trade['profit_loss']:.2f}); opening {new_side}")
     return new_side
 
@@ -664,6 +762,7 @@ async def update_trades(current_prices: Dict[str, Any]):
             except Exception:
                 end_ts = now_ts
         expired = now_ts >= end_ts
+        trade["awaiting_resolution"] = expired and trade.get("status") == "OPEN"
 
         if expired and trade.get("close_price") is None:
             frozen_close = cur_price or trade.get("last_price")
@@ -789,6 +888,7 @@ async def update_trades(current_prices: Dict[str, Any]):
     state["active_trades"] = remaining_active
     if trades_changed:
         save_state()
+        _sync_active_trades_to_latest_data()
 
 # ── Capital Extractor (Auto-Withdrawal State Machine) ─────────────────────────
 async def maybe_auto_withdraw(equity: float, poly_snapshot: Dict[str, Any]):
@@ -797,7 +897,8 @@ async def maybe_auto_withdraw(equity: float, poly_snapshot: Dict[str, Any]):
         return
     if state["trading_mode"] != "live":
         return
-    if not settings.WITHDRAW_ADDRESS or settings.WITHDRAW_AMOUNT <= 0:
+    dest_address = settings.WITHDRAW_ADDRESS or (clob_trader.get_eoa_address() if clob_trader else None)
+    if not dest_address or settings.WITHDRAW_AMOUNT <= 0:
         return
 
     now_ts = time.time()
@@ -811,19 +912,19 @@ async def maybe_auto_withdraw(equity: float, poly_snapshot: Dict[str, Any]):
                 state["withdraw_submitted_at"] = now_ts
                 state["withdraw_locked_market"] = poly_snapshot.get("market", {}).get("id") if poly_snapshot.get("ok") else None
                 
-                res = await asyncio.to_thread(clob_trader.withdraw_pusd, settings.WITHDRAW_ADDRESS, settings.WITHDRAW_AMOUNT)
+                res = await asyncio.to_thread(clob_trader.withdraw_pusd, dest_address, settings.WITHDRAW_AMOUNT)
                 if res.get("ok"):
                     tx = res.get("tx")
                     state["last_withdrawal"] = {
                         "amount": settings.WITHDRAW_AMOUNT,
-                        "recipient": settings.WITHDRAW_ADDRESS,
+                        "recipient": dest_address,
                         "timestamp": datetime.now().isoformat(),
                         "tx": tx,
                         "status": "submitted"
                     }
                     save_state()
                     log_message(f"CAPITAL EXTRACTOR: Withdrawal tx submitted ({tx}). Waiting confirmation...")
-                    await send_telegram(f"💸 *Capital Extractor*\nWithdrew `${settings.WITHDRAW_AMOUNT:.2f}` pUSD to `{settings.WITHDRAW_ADDRESS}`\nTx: `{tx}`")
+                    await send_telegram(f"💸 *Capital Extractor*\nWithdrew `${settings.WITHDRAW_AMOUNT:.2f}` pUSD to `{dest_address}`\nTx: `{tx}`")
                 else:
                     log_message(f"CAPITAL EXTRACTOR FAILED: {res.get('error')}")
                     state["withdraw_state"] = "cooldown"
@@ -850,9 +951,11 @@ async def maybe_auto_withdraw(equity: float, poly_snapshot: Dict[str, Any]):
 
         can_resume = False
         sub_at = state.get("withdraw_submitted_at") or now_ts
-        if resume_after == "flat":
+        if resume_after in ("flat", "confirmed"):
             if now_ts - sub_at > 30:
                 can_resume = True
+        elif resume_after == "submitted":
+            can_resume = True
         elif resume_after == "next_window":
             cur_mkt_id = poly_snapshot.get("market", {}).get("id") if poly_snapshot.get("ok") else None
             if cur_mkt_id and cur_mkt_id != state.get("withdraw_locked_market"):
@@ -977,9 +1080,9 @@ async def refresh_redeemable():
         for p in raw_pos:
             cid = p.get("conditionId") or p.get("condition_id")
             size = float(p.get("size") or 0.0)
-            cur_val = float(p.get("currentValue") or (float(p.get("curPrice", 0) or 0) * size) or 0.0)
-            resolved = p.get("resolved") or p.get("redeemable") or (p.get("curPrice") == 1.0)
-            if size > 0 and (resolved or p.get("redeemable")):
+            is_redeemable = p.get("redeemable") is True or str(p.get("redeemable", "")).lower() == "true"
+            if size > 0 and is_redeemable:
+                cur_val = float(p.get("currentValue") or (float(p.get("curPrice", 0) or 0) * size) or size)
                 sub_ts = state["redeem_submitted"].get(cid, 0)
                 if now_ts - sub_ts > REDEEM_SUBMITTED_HIDE_S:
                     valid_pos.append(p)
@@ -1503,6 +1606,106 @@ async def redeem_single(req: Dict[str, Any]):
         await broadcast_state()
     return res
 
+@app.post("/api/redeemable/refresh")
+async def post_refresh_redeemable():
+    return await refresh_redeemable()
+
+@app.get("/api/telegram-subscribers")
+async def get_telegram_subscribers():
+    subs = state.get("telegram_subscribers", [])
+    normalized = []
+    for s in subs:
+        norm = _normalize_subscriber(s)
+        if norm:
+            normalized.append(norm)
+    return {"ok": True, "subscribers": normalized}
+
+@app.post("/api/telegram-unsubscribe")
+async def post_telegram_unsubscribe(req: Dict[str, Any]):
+    chat_id = req.get("chat_id")
+    if chat_id is not None:
+        try:
+            remove_telegram_subscriber(int(chat_id))
+        except (ValueError, TypeError):
+            pass
+    return {"ok": True}
+
+@app.post("/api/test-telegram")
+async def post_test_telegram(req: Optional[Dict[str, Any]] = None):
+    req = req or {}
+    token = (req.get("bot_token") or "").strip()
+    if not token or "..." in token or token.lower() == "set":
+        token = settings.TELEGRAM_BOT_TOKEN
+    
+    if not token:
+        return {"ok": False, "error": "No bot token provided. Enter your Telegram Bot Token from @BotFather."}
+    
+    url = f"https://api.telegram.org/bot{token}/getMe"
+    proxy = ws_data.get_proxy_url_for(url)
+    try:
+        async with httpx.AsyncClient(proxy=proxy if proxy else None, timeout=8.0) as client:
+            resp = await client.get(url)
+            if resp.status_code == 401:
+                return {
+                    "ok": False,
+                    "error": "Invalid Bot Token (401 Unauthorized from Telegram). Please verify the token from @BotFather."
+                }
+            if resp.status_code != 200:
+                return {
+                    "ok": False,
+                    "error": f"Telegram API error (HTTP {resp.status_code}): {resp.text}"
+                }
+            bot_info = resp.json().get("result", {})
+            username = bot_info.get("username", "bot")
+            bot_name = bot_info.get("first_name", "Bot")
+    except Exception as e:
+        return {"ok": False, "error": f"Failed to connect to Telegram API: {e}"}
+
+    subs = state.get("telegram_subscribers", [])
+    if not subs:
+        return {
+            "ok": True,
+            "count": 0,
+            "bot_username": username,
+            "message": f"Connected as @{username} ({bot_name})! No subscribers yet — open https://t.me/{username} and send /start to subscribe."
+        }
+
+    sent_count = 0
+    errors = []
+    send_url = f"https://api.telegram.org/bot{token}/sendMessage"
+    async with httpx.AsyncClient(proxy=proxy if proxy else None, timeout=8.0) as client:
+        for s in subs:
+            cid = s.get("chat_id") if isinstance(s, dict) else s
+            if not cid:
+                continue
+            try:
+                s_resp = await client.post(send_url, json={
+                    "chat_id": cid,
+                    "text": f"🔔 *Test alert from Polymarket Assistant!*\nBot @{username} is connected and operational.",
+                    "parse_mode": "Markdown"
+                })
+                if s_resp.status_code == 200:
+                    sent_count += 1
+                else:
+                    errors.append(f"Chat {cid}: HTTP {s_resp.status_code}")
+            except Exception as e:
+                errors.append(f"Chat {cid}: {e}")
+
+    if sent_count > 0:
+        return {
+            "ok": True,
+            "count": sent_count,
+            "bot_username": username,
+            "message": f"Connected as @{username}! Sent test alert to {sent_count} subscriber(s)."
+        }
+    else:
+        err_msg = ", ".join(errors) if errors else "failed to send message"
+        return {
+            "ok": False,
+            "bot_username": username,
+            "error": f"Connected as @{username}, but failed to deliver to subscribers: {err_msg}"
+        }
+
 @app.get("/api/settings")
 async def get_settings():
     def mask(v: str) -> str:
@@ -1550,8 +1753,11 @@ async def get_settings():
             "trigger_balance": settings.WITHDRAW_TRIGGER_BALANCE,
             "withdraw_amount": settings.WITHDRAW_AMOUNT,
             "recipient_address": settings.WITHDRAW_ADDRESS,
+            "withdraw_address": settings.WITHDRAW_ADDRESS,
             "auto_resume": settings.WITHDRAW_AUTO_RESUME,
-            "resume_after": settings.WITHDRAW_RESUME_AFTER
+            "auto_resume_after_withdrawal": settings.WITHDRAW_AUTO_RESUME,
+            "resume_after": settings.WITHDRAW_RESUME_AFTER,
+            "default_destination": (clob_trader.get_eoa_address() if clob_trader else "") or ""
         },
         "telegram": {
             "enabled": settings.TELEGRAM_ENABLED,
@@ -1653,15 +1859,21 @@ async def post_settings(new_settings: Dict[str, Any]):
         if "enabled" in ce: settings.AUTO_WITHDRAW_ENABLED = bool(ce["enabled"])
         if "trigger_balance" in ce: settings.WITHDRAW_TRIGGER_BALANCE = float(ce["trigger_balance"])
         if "withdraw_amount" in ce: settings.WITHDRAW_AMOUNT = float(ce["withdraw_amount"])
-        if "recipient_address" in ce: settings.WITHDRAW_ADDRESS = str(ce["recipient_address"]).strip()
-        if "auto_resume" in ce: settings.WITHDRAW_AUTO_RESUME = bool(ce["auto_resume"])
+        recip = ce.get("recipient_address") if "recipient_address" in ce else ce.get("withdraw_address")
+        if recip is not None:
+            settings.WITHDRAW_ADDRESS = str(recip).strip()
+            ce["recipient_address"] = settings.WITHDRAW_ADDRESS
+        auto_res = ce.get("auto_resume") if "auto_resume" in ce else ce.get("auto_resume_after_withdrawal")
+        if auto_res is not None:
+            settings.WITHDRAW_AUTO_RESUME = bool(auto_res)
+            ce["auto_resume"] = settings.WITHDRAW_AUTO_RESUME
         if "resume_after" in ce: settings.WITHDRAW_RESUME_AFTER = str(ce["resume_after"]).strip()
 
     if "telegram" in new_settings:
         tg = new_settings["telegram"]
         if "enabled" in tg: settings.TELEGRAM_ENABLED = bool(tg["enabled"])
         tok = tg.get("bot_token")
-        if tok and "..." not in tok:
+        if tok and "..." not in tok and tok.lower() != "set":
             settings.TELEGRAM_BOT_TOKEN = str(tok).strip()
 
     clob_trader.reset()
