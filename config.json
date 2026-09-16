@@ -20,7 +20,7 @@
   },
   "telegram": {
     "enabled": false,
-    "bot_token": "8394214124:AAGQs5vsfU3EustebtWTwtVk4ZgDcCeR-to"
+    "bot_token": ""
   },
   "polymarket": {
     "gamma_base_url": "https://gamma-api.polymarket.com",
