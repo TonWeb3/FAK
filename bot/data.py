@@ -205,22 +205,3 @@ def sweep_sell(bids: List[Dict], size: float) -> Optional[float]:
     if total_size <= 0:
         return None
     return total_val / total_size
-
-async def fetch_redeemable_positions(funder_address: str) -> List[Dict]:
-    """Fetch redeemable / resolved positions for the wallet from Polymarket data API."""
-    if not funder_address:
-        return []
-    url = "https://data-api.polymarket.com/positions"
-    params = {"user": funder_address, "sizeThreshold": "0.01", "redeemable": "true"}
-    proxy = get_proxy_url_for(url)
-    try:
-        async with httpx.AsyncClient(proxy=proxy if proxy else None, timeout=10.0) as client:
-            res = await client.get(url, params=params)
-            res.raise_for_status()
-            data = res.json()
-            if isinstance(data, list):
-                return data
-            return []
-    except Exception as e:
-        print(f"Warning: fetch_redeemable_positions failed: {e}")
-        return []

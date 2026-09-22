@@ -202,80 +202,7 @@
                         </div>
                     </div>
 
-                    <!-- Redeem: winning positions still waiting to be turned back into pUSD.
-                         The count comes from Polymarket's positions API for the funded wallet,
-                         so it includes failed auto-redeems and excludes anything already
-                         redeemed elsewhere. Hidden only when there is no wallet at all. -->
-                    <div x-show="data.trading_state?.mode === 'live' && (redeem.has_key || redeem.count > 0)"
-                         class="mb-4 p-3 rounded-lg border"
-                         :class="redeem.count > 0 ? 'bg-emerald-900/20 border-emerald-700/60' : 'bg-gray-900/40 border-gray-700'">
-                        <div class="flex flex-col sm:flex-row sm:items-center gap-3">
-                            <button @click="redeemAll()"
-                                    :disabled="redeemBusy || run.busy || !redeem.count"
-                                    class="flex items-center justify-center gap-2 px-4 py-2 rounded-lg font-bold text-xs uppercase tracking-wide transition disabled:cursor-not-allowed"
-                                    :class="redeem.count > 0 && !run.busy ? 'bg-emerald-600 hover:bg-emerald-500 text-white' : 'bg-gray-700 text-gray-400'">
-                                <svg x-show="run.busy" class="animate-spin h-4 w-4" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24">
-                                    <circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle>
-                                    <path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z"></path>
-                                </svg>
-                                <span x-text="run.busy ? ('Redeeming ' + run.done + ' / ' + run.total) : 'Redeem All'"></span>
-                                <span x-show="!run.busy"
-                                      class="min-w-[1.5rem] px-1.5 py-0.5 rounded-full text-[11px] font-mono"
-                                      :class="redeem.count > 0 ? 'bg-white text-emerald-700' : 'bg-gray-600 text-gray-300'"
-                                      x-text="redeem.count || 0"></span>
-                            </button>
 
-                            <div class="flex-1 min-w-0 text-[11px] leading-snug">
-                                <p x-show="redeem.count > 0" class="text-emerald-300 font-bold"
-                                   x-text="redeem.count + ' winning ' + (redeem.count === 1 ? 'trade' : 'trades') + ' not yet redeemed — $' + Number(redeem.value || 0).toFixed(2) + ' waiting'"></p>
-                                <p x-show="!redeem.count && redeem.has_key" class="text-gray-400">Nothing waiting to be redeemed.</p>
-                                <p class="text-gray-500">
-                                    <span x-text="redeem.checked_at ? ('Checked ' + agoText(redeem.checked_at)) : 'Not checked yet'"></span>
-                                    <button @click="refreshRedeemable()" :disabled="redeemChecking || run.busy"
-                                            class="ml-2 text-blue-400 hover:text-blue-300 underline disabled:opacity-50"
-                                            x-text="redeemChecking ? 'checking…' : 'check now'"></button>
-                                </p>
-                                <p x-show="redeem.error" class="text-amber-400" x-text="redeem.error"></p>
-                                <p x-show="!run.busy && run.finished_at"
-                                   :class="run.failed ? 'text-amber-400' : 'text-emerald-400'"
-                                   x-text="'Last run: ' + run.ok + ' redeemed' + (run.failed ? (', ' + run.failed + ' failed') : '')"></p>
-                            </div>
-
-                            <button x-show="redeem.count > 0" @click="showRedeemList = !showRedeemList"
-                                    class="text-[11px] text-gray-400 hover:text-white underline self-start sm:self-center"
-                                    x-text="showRedeemList ? 'hide list' : 'show list'"></button>
-                        </div>
-
-                        <!-- Every trade still waiting, so it is clear exactly what the button redeems -->
-                        <div x-show="showRedeemList && redeem.count > 0" class="mt-3 overflow-x-auto">
-                            <table class="w-full text-left text-[11px] min-w-[420px]">
-                                <thead>
-                                    <tr class="text-gray-500 uppercase tracking-wider">
-                                        <th class="py-1 pr-3">Market</th>
-                                        <th class="py-1 pr-3">Side</th>
-                                        <th class="py-1 pr-3 text-right">Shares</th>
-                                        <th class="py-1 pr-3 text-right">Value</th>
-                                        <th class="py-1 text-right">Source</th>
-                                    </tr>
-                                </thead>
-                                <tbody>
-                                    <template x-for="p in (redeem.positions || [])" :key="p.condition_id">
-                                        <tr class="border-t border-gray-800">
-                                            <td class="py-1.5 pr-3 truncate max-w-[220px]" x-text="p.slug || p.title || p.condition_id"></td>
-                                            <td class="py-1.5 pr-3 font-bold" :class="(p.outcome || '').toLowerCase() === 'up' ? 'text-green-400' : 'text-red-400'" x-text="(p.outcome || '-').toUpperCase()"></td>
-                                            <td class="py-1.5 pr-3 text-right font-mono" x-text="Number(p.size).toFixed(2)"></td>
-                                            <td class="py-1.5 pr-3 text-right font-mono text-emerald-400" x-text="'$' + Number(p.value).toFixed(2)"></td>
-                                            <td class="py-1.5 text-right text-gray-500" x-text="p.from_bot ? 'bot trade' : 'wallet'"
-                                                :title="p.from_bot ? 'Matches a trade in this bot\'s history' : 'Held by the wallet but not in this bot\'s history (e.g. a manual trade) — redeemed too'"></td>
-                                        </tr>
-                                    </template>
-                                </tbody>
-                            </table>
-                        </div>
-
-                        <p x-show="run.errors && run.errors.length" class="mt-2 text-[10px] text-amber-400 font-mono break-all"
-                           x-text="(run.errors || []).slice(-3).join(' | ')"></p>
-                    </div>
 
                     <div class="overflow-x-auto -mx-4 sm:mx-0">
                         <table class="w-full text-left min-w-[500px] sm:min-w-0">
@@ -438,44 +365,7 @@
                 live: false,          // true while the push socket is connected
                 lastLogSeq: -1,
                 wsRetry: 0,
-                redeemBusy: false,    // the click itself; the run's own progress is run.busy
-                redeemChecking: false,
-                showRedeemList: false,
-                // Pushed by the server with every snapshot, so the count and progress stay
-                // live without polling.
-                get redeem() { return this.data.trading_state?.redeem || {}; },
-                get run() { return this.redeem.run || {}; },
-                async redeemAll() {
-                    if (this.redeemBusy || this.run.busy || !this.redeem.count) return;
-                    this.redeemBusy = true;
-                    try {
-                        const res = await (await fetch('/api/redeem-all', { method: 'POST' })).json();
-                        if (!res.ok) alert('Redeem All could not start: ' + (res.error || 'unknown error'));
-                    } catch (e) {
-                        alert('Redeem All request failed - is the bot still running?');
-                    }
-                    this.redeemBusy = false;
-                },
-                async refreshRedeemable() {
-                    this.redeemChecking = true;
-                    try {
-                        const r = await (await fetch('/api/redeemable/refresh', { method: 'POST' })).json();
-                        // Apply immediately; the next pushed snapshot will agree.
-                        if (this.data.trading_state) {
-                            this.data.trading_state.redeem = Object.assign({}, this.redeem, {
-                                count: r.count, value: r.value, positions: r.positions,
-                                checked_at: r.checked_at, error: r.error, run: r.run });
-                        }
-                    } catch (e) { /* the watcher re-checks every minute regardless */ }
-                    this.redeemChecking = false;
-                },
-                agoText(ts) {
-                    const s = Math.max(0, Math.round(Date.now() / 1000 - ts));
-                    if (s < 5) return 'just now';
-                    if (s < 60) return s + 's ago';
-                    if (s < 3600) return Math.round(s / 60) + 'm ago';
-                    return Math.round(s / 3600) + 'h ago';
-                },
+
                 init() {
                     this.refresh();          // paint immediately, don't wait for the socket
                     this.loadFiles();
@@ -518,13 +408,7 @@
                     // Merge WS-only fields that are not part of the inner state dict
                     if (frame && frame.type === 'state_update') {
                         if (frame.logs != null) this.logs = (frame.logs || []).slice().reverse();
-                        if (this.data && frame.redeemable != null) {
-                            if (!this.data.trading_state) this.data.trading_state = {};
-                            this.data.trading_state.redeem = {
-                                ...frame.redeemable,
-                                run: frame.redeem_run || {}
-                            };
-                        }
+
                     }
                     this.lastUpdate = new Date().toLocaleTimeString();
                     // Keep Start/Stop in sync with the server, but not while a click is

@@ -53,11 +53,6 @@ def _sync_active_trades_to_latest_data():
 def _wake_entry(data_payload=None):
     _market_event.set()
 
-# ── Redemption state ──────────────────────────────────────────────────────────
-REDEEM_CHECK_INTERVAL_S = 60
-REDEEM_SUBMITTED_HIDE_S = 15 * 60
-_redeem_wake = asyncio.Event()
-_redeem_lock = asyncio.Lock()
 
 # ── Global state ───────────────────────────────────────────────────────────────
 state = {
@@ -87,10 +82,6 @@ state = {
     # Event-driven execution
     "trade_ctx": None,
     "event_exec": None,
-    # Redeem tracking
-    "redeemable": {"positions": [], "count": 0, "value": 0.0, "checked_at": None, "error": None},
-    "redeem_run": {"busy": False, "total": 0, "done": 0, "ok": 0, "failed": 0, "errors": [], "value": 0.0, "finished_at": None},
-    "redeem_submitted": {},
 }
 
 def log_message(msg: str):
@@ -109,8 +100,7 @@ def save_state():
             "active_trades": state["active_trades"],
             "trade_history": state["trade_history"],
             "last_trade_side": state["last_trade_side"],
-            "last_withdrawal": state.get("last_withdrawal"),
-            "redeem_submitted": state.get("redeem_submitted", {})
+            "last_withdrawal": state.get("last_withdrawal")
         }
         with open(STATE_PATH, "w") as f:
             json.dump(data_to_save, f, indent=2)
@@ -136,7 +126,6 @@ def load_state():
                 state["trade_history"] = loaded.get("trade_history", [])
                 state["last_trade_side"] = loaded.get("last_trade_side")
                 state["last_withdrawal"] = loaded.get("last_withdrawal")
-                state["redeem_submitted"] = loaded.get("redeem_submitted", {})
                 log_message(f"State loaded from {STATE_PATH}")
     except Exception as e:
         print(f"Error loading state: {e}")
@@ -315,8 +304,6 @@ async def broadcast_state():
         "data": state["latest_data"],
         "logs": state["logs"][-20:],
         "log_seq": state["log_seq"],
-        "redeemable": state["redeemable"],
-        "redeem_run": state["redeem_run"],
     })
     dead = set()
     for ws in list(_ws_clients):
@@ -729,12 +716,9 @@ async def _redeem_win(trade: Dict[str, Any], market: Optional[Dict[str, Any]],
 
     trade["redeem"] = res
     if res.get("ok"):
-        state["redeem_submitted"][condition_id] = time.time()
         log_message(f"REDEEM ok for {trade['market_slug']}: {amounts[idx]:.2f} shares (tx {res.get('tx')})")
-        _redeem_wake.set()
     else:
-        log_message(f"REDEEM FAILED for {trade['market_slug']}: {res.get('error')} "
-                    f"— redeem manually via dashboard to free the capital")
+        log_message(f"REDEEM FAILED for {trade['market_slug']}: {res.get('error')}")
 
 def _archive(trade: Dict[str, Any]) -> Dict[str, Any]:
     for k in ("_market", "_market_closed", "order_response"):
@@ -1063,94 +1047,6 @@ async def entry_watcher():
         except Exception:
             await asyncio.sleep(0.1)
 
-# ── Manual & background redemption ────────────────────────────────────────────
-async def refresh_redeemable():
-    if state["trading_mode"] != "live":
-        state["redeemable"] = {"positions": [], "count": 0, "value": 0.0, "checked_at": datetime.now().isoformat(), "error": None}
-        return state["redeemable"]
-    funder = clob_trader.get_funder()
-    if not funder:
-        state["redeemable"] = {"positions": [], "count": 0, "value": 0.0, "checked_at": datetime.now().isoformat(), "error": "no_funder"}
-        return state["redeemable"]
-    try:
-        raw_pos = await data.fetch_redeemable_positions(funder)
-        now_ts = time.time()
-        valid_pos = []
-        tot_val = 0.0
-        for p in raw_pos:
-            cid = p.get("conditionId") or p.get("condition_id")
-            size = float(p.get("size") or 0.0)
-            is_redeemable = p.get("redeemable") is True or str(p.get("redeemable", "")).lower() == "true"
-            if size > 0 and is_redeemable:
-                cur_val = float(p.get("currentValue") or (float(p.get("curPrice", 0) or 0) * size) or size)
-                sub_ts = state["redeem_submitted"].get(cid, 0)
-                if now_ts - sub_ts > REDEEM_SUBMITTED_HIDE_S:
-                    valid_pos.append(p)
-                    tot_val += cur_val if cur_val > 0 else size
-        state["redeemable"] = {
-            "positions": valid_pos,
-            "count": len(valid_pos),
-            "value": round(tot_val, 2),
-            "checked_at": datetime.now().isoformat(),
-            "error": None
-        }
-    except Exception as e:
-        state["redeemable"] = {"positions": [], "count": 0, "value": 0.0, "checked_at": datetime.now().isoformat(), "error": str(e)}
-    return state["redeemable"]
-
-async def _redeem_all_run():
-    async with _redeem_lock:
-        if state["redeem_run"]["busy"]:
-            return state["redeem_run"]
-        state["redeem_run"]["busy"] = True
-        state["redeem_run"]["errors"] = []
-        try:
-            await refresh_redeemable()
-            positions = state["redeemable"].get("positions", [])
-            state["redeem_run"]["total"] = len(positions)
-            state["redeem_run"]["done"] = 0
-            state["redeem_run"]["ok"] = 0
-            state["redeem_run"]["failed"] = 0
-            state["redeem_run"]["value"] = state["redeemable"].get("value", 0.0)
-
-            for p in positions:
-                cid = p.get("conditionId") or p.get("condition_id")
-                size = float(p.get("size") or 0.0)
-                neg_risk = bool(p.get("negRisk") or p.get("neg_risk") or False)
-                outcome_idx = int(p.get("outcomeIndex", 0))
-                amts = [0.0, 0.0]
-                if 0 <= outcome_idx < len(amts):
-                    amts[outcome_idx] = size
-                else:
-                    amts = [size, 0.0]
-                
-                res = await asyncio.to_thread(clob_trader.redeem, cid, amts, neg_risk)
-                state["redeem_run"]["done"] += 1
-                if res.get("ok"):
-                    state["redeem_run"]["ok"] += 1
-                    state["redeem_submitted"][cid] = time.time()
-                    log_message(f"MANUAL REDEEM: Successfully redeemed {size:.2f} shares for condition {cid[:8]}... (tx: {res.get('tx')})")
-                else:
-                    state["redeem_run"]["failed"] += 1
-                    state["redeem_run"]["errors"].append(f"{cid[:8]}: {res.get('error')}")
-                    log_message(f"MANUAL REDEEM FAILED: {res.get('error')} on condition {cid[:8]}...")
-            
-            state["redeem_run"]["finished_at"] = datetime.now().isoformat()
-            save_state()
-            await refresh_redeemable()
-            await broadcast_state()
-        finally:
-            state["redeem_run"]["busy"] = False
-        return state["redeem_run"]
-
-async def redeem_watcher():
-    while True:
-        try:
-            await asyncio.sleep(REDEEM_CHECK_INTERVAL_S)
-            await refresh_redeemable()
-            await broadcast_state()
-        except Exception:
-            pass
 
 async def seed_kline_buffers():
     try:
@@ -1445,9 +1341,6 @@ async def update_loop():
 async def lifespan(app: FastAPI):
     load_state()
     await seed_kline_buffers()
-    if state["trading_mode"] == "live":
-        asyncio.create_task(refresh_redeemable())
-
     tasks = [
         asyncio.create_task(binance_stream.start()),
         asyncio.create_task(binance_kline_1m.start()),
@@ -1457,8 +1350,7 @@ async def lifespan(app: FastAPI):
         asyncio.create_task(chainlink_ws_stream.start()),
         asyncio.create_task(update_loop()),
         asyncio.create_task(telegram_poller()),
-        asyncio.create_task(entry_watcher()),
-        asyncio.create_task(redeem_watcher())
+        asyncio.create_task(entry_watcher())
     ]
 
     yield
@@ -1486,8 +1378,6 @@ async def websocket_endpoint(websocket: WebSocket):
             "data": state["latest_data"],
             "logs": state["logs"][-30:],
             "log_seq": state["log_seq"],
-            "redeemable": state["redeemable"],
-            "redeem_run": state["redeem_run"],
         })
         await websocket.send_text(init_msg)
         while True:
@@ -1576,39 +1466,6 @@ async def stop_trading():
 async def get_available_series():
     return await data.fetch_available_15m_series()
 
-@app.get("/api/redeemable")
-async def get_redeemable():
-    return await refresh_redeemable()
-
-@app.post("/api/redeem-all")
-async def redeem_all():
-    if state["trading_mode"] != "live":
-        return {"ok": False, "error": "live_mode_only"}
-    if state["redeem_run"]["busy"]:
-        return {"ok": False, "error": "already_running"}
-    res = await _redeem_all_run()
-    return {"ok": True, "result": res}
-
-@app.post("/api/redeem")
-async def redeem_single(req: Dict[str, Any]):
-    if state["trading_mode"] != "live":
-        return {"ok": False, "error": "live_mode_only"}
-    condition_id = req.get("condition_id")
-    amounts = req.get("amounts", [0.0, 0.0])
-    neg_risk = bool(req.get("neg_risk", False))
-    if not condition_id:
-        return {"ok": False, "error": "missing_condition_id"}
-    res = await asyncio.to_thread(clob_trader.redeem, condition_id, amounts, neg_risk)
-    if res.get("ok"):
-        state["redeem_submitted"][condition_id] = time.time()
-        save_state()
-        await refresh_redeemable()
-        await broadcast_state()
-    return res
-
-@app.post("/api/redeemable/refresh")
-async def post_refresh_redeemable():
-    return await refresh_redeemable()
 
 @app.get("/api/telegram-subscribers")
 async def get_telegram_subscribers():

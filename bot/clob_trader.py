@@ -252,7 +252,7 @@ class ClobTrader:
             price=round(float(price), 4) if price else 0,
             order_type=ot,
         )
-        resp = self.clob.create_and_post_market_order(args)
+        resp = self.clob.create_and_post_market_order(args, order_type=ot)
         if resp is None:
             return {"ok": False, "error": "no_response_from_clob", "response": {}}
 
