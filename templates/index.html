@@ -60,8 +60,9 @@
                       :class="data.trading_state?.withdraw?.state === 'ARMED' ? 'bg-gray-700 text-emerald-400' : 'bg-amber-600 text-white'"
                       :title="'Auto-withdraw: $' + (data.trading_state?.withdraw?.amount ?? '-') + ' once equity reaches $' + (data.trading_state?.withdraw?.trigger_balance ?? '-')"
                       x-text="'⤓ ' + (data.trading_state?.withdraw?.state || '')"></span>
-                <span :class="data.trading_state?.mode === 'paper' ? 'bg-yellow-600' : 'bg-red-600'"
-                      class="px-3 py-1 rounded-full font-bold uppercase text-[10px] sm:text-xs" x-text="data.trading_state?.mode"></span>
+                <span :class="data.trading_state?.has_live_creds ? 'bg-emerald-900/80 text-emerald-300 border border-emerald-500/50' : 'bg-gray-800 text-gray-400 border border-gray-700'"
+                      class="px-3 py-1 rounded-full font-bold uppercase text-[10px] sm:text-xs tracking-wider"
+                      x-text="data.trading_state?.has_live_creds ? 'Live Copy Active' : 'Paper Only (No Key)'"></span>
                 <span class="bg-gray-800 px-3 py-1 rounded text-gray-400 text-[10px] sm:text-xs flex items-center gap-1.5"
                       :title="live ? 'Live — the server pushes each update over a websocket' : 'Push socket down — falling back to 1s polling'">
                     <span class="w-1.5 h-1.5 rounded-full" :class="live ? 'bg-green-500' : 'bg-amber-500'"></span>
@@ -191,51 +192,74 @@
                 <!-- Active Trades -->
                 <div x-show="tab === 'active'">
                     <div class="flex flex-col sm:flex-row justify-between items-start sm:items-center mb-4 gap-2">
-                        <h3 class="text-lg sm:text-xl font-bold">Equity</h3>
+                        <h3 class="text-lg sm:text-xl font-bold">Live Wallet</h3>
                         <div class="text-right">
-                            <span class="text-xl sm:text-2xl font-bold text-green-500"
-                                  x-text="'$' + ((data.trading_state?.equity ?? data.trading_state?.balance) != null ? (data.trading_state?.equity ?? data.trading_state?.balance).toLocaleString(undefined, {maximumFractionDigits: 2}) : '1,000')"></span>
-                            <p class="text-[10px] text-gray-500 uppercase tracking-tighter">
-                                <span x-text="'Cash $' + (data.trading_state?.balance != null ? data.trading_state.balance.toLocaleString(undefined, {maximumFractionDigits: 2}) : '-')"></span>
-                                <span x-show="data.trading_state?.open_value > 0" x-text="' + Open $' + (data.trading_state?.open_value != null ? data.trading_state.open_value.toLocaleString(undefined, {maximumFractionDigits: 2}) : '-')"></span>
-                            </p>
+                            <template x-if="data.trading_state?.has_live_creds">
+                                <div>
+                                    <span class="text-xl sm:text-2xl font-bold text-green-500"
+                                          x-text="'$' + (data.trading_state?.equity != null ? data.trading_state.equity.toLocaleString(undefined, {minimumFractionDigits: 2, maximumFractionDigits: 2}) : '0.00')"></span>
+                                    <p class="text-[10px] text-gray-500 uppercase tracking-tighter">
+                                        <span x-text="'Cash $' + (data.trading_state?.balance != null ? data.trading_state.balance.toLocaleString(undefined, {minimumFractionDigits: 2, maximumFractionDigits: 2}) : '0.00')"></span>
+                                        <span x-show="data.trading_state?.open_value > 0" x-text="' + Open $' + (data.trading_state?.open_value != null ? data.trading_state.open_value.toLocaleString(undefined, {minimumFractionDigits: 2, maximumFractionDigits: 2}) : '0.00')"></span>
+                                    </p>
+                                </div>
+                            </template>
+                            <template x-if="!data.trading_state?.has_live_creds">
+                                <span class="text-xs font-bold text-gray-400 bg-gray-700/50 border border-gray-700 px-3 py-1.5 rounded-lg inline-block">
+                                    Paper mode active (Set private key in Settings to enable Live copy)
+                                </span>
+                            </template>
                         </div>
                     </div>
 
-
-
                     <div class="overflow-x-auto -mx-4 sm:mx-0">
-                        <table class="w-full text-left min-w-[500px] sm:min-w-0">
+                        <table class="w-full text-left min-w-[650px] sm:min-w-0">
                             <thead>
                                 <tr class="text-gray-500 text-xs uppercase tracking-wider">
                                     <th class="px-4 py-2">Market</th>
                                     <th class="px-4 py-2">Side</th>
-                                    <th class="px-4 py-2">Entry</th>
+                                    <th class="px-4 py-2">Entry (Paper)</th>
+                                    <th class="px-4 py-2">Entry (Live)</th>
                                     <th class="px-4 py-2">Shares</th>
-                                    <th class="px-4 py-2">Opened by</th>
                                     <th class="px-4 py-2">Unreal. P/L</th>
+                                    <th class="px-4 py-2">Opened</th>
                                     <th class="px-4 py-2 text-right">Status</th>
                                 </tr>
                             </thead>
                             <tbody class="text-[11px] sm:text-sm">
-                                <template x-for="trade in data.trading_state?.active_trades" :key="trade.trade_id || trade.order_id || (trade.market_id + '_' + trade.entry_time)">
+                                <template x-for="trade in data.trading_state?.active_trades" :key="trade.trade_id || trade.order_id || (trade.market_id + '_' + trade.paper_entry_time)">
                                     <tr class="border-t border-gray-700 hover:bg-gray-700/30 transition">
-                                        <td class="px-4 py-3 truncate max-w-[150px] sm:max-w-[200px]" x-text="trade.market_slug"></td>
+                                        <td class="px-4 py-3 truncate max-w-[150px] sm:max-w-[180px]" x-text="trade.market_slug"></td>
                                         <td class="px-4 py-3 font-bold" :class="trade.side === 'UP' ? 'text-green-400' : 'text-red-400'" x-text="trade.side"></td>
-                                        <td class="px-4 py-3 font-mono" x-text="(trade.entry_price * 100).toFixed(0) + '¢'"></td>
-                                        <td class="px-4 py-3 font-mono" x-text="trade.shares.toFixed(2)"></td>
-                                        <td class="px-4 py-3 font-mono font-bold" :class="trade.open_reason === 'flip_entry' ? 'text-orange-400' : 'text-blue-400'" x-text="trade.open_reason === 'flip_entry' ? 'FLIP' : 'EV'"></td>
+                                        <td class="px-4 py-3 font-mono text-gray-300" x-text="trade.paper_entry_price != null ? ((trade.paper_entry_price * 100).toFixed(0) + '¢') : ((trade.entry_price * 100).toFixed(0) + '¢')"></td>
+                                        <td class="px-4 py-3 font-mono font-bold">
+                                            <span x-show="trade.live_status === 'FILLED'" class="text-emerald-400" x-text="trade.live_entry_price != null ? ((trade.live_entry_price * 100).toFixed(0) + '¢') : '—'"></span>
+                                            <span x-show="trade.live_status === 'FILLING'" class="text-amber-400 animate-pulse text-xs" x-text="'Filling (#' + (trade.live_attempts || 1) + ')…'"></span>
+                                            <span x-show="trade.live_status === 'NO_CREDS'" class="text-gray-500 text-xs">No Key</span>
+                                            <span x-show="trade.live_status !== 'FILLED' && trade.live_status !== 'FILLING' && trade.live_status !== 'NO_CREDS'" class="text-gray-500 text-xs" x-text="trade.live_status || '—'"></span>
+                                        </td>
+                                        <td class="px-4 py-3 font-mono" x-text="(trade.live_status === 'FILLED' && trade.live_shares != null) ? trade.live_shares.toFixed(2) : '—'"></td>
                                         <td class="px-4 py-3 font-mono font-bold"
-                                            :class="trade.unrealized_pl == null ? 'text-gray-500' : (trade.unrealized_pl >= 0 ? 'text-green-400' : 'text-red-400')"
-                                            x-text="trade.unrealized_pl == null ? '—' : ((trade.unrealized_pl >= 0 ? '+$' : '-$') + Math.abs(trade.unrealized_pl).toFixed(2))"></td>
+                                            :class="(trade.live_status === 'FILLED' && trade.live_unrealized_pl != null) ? (trade.live_unrealized_pl >= 0 ? 'text-green-400' : 'text-red-400') : 'text-gray-500'"
+                                            x-text="(trade.live_status === 'FILLED' && trade.live_unrealized_pl != null) ? ((trade.live_unrealized_pl >= 0 ? '+$' : '-$') + Math.abs(trade.live_unrealized_pl).toFixed(2)) : '—'"></td>
+                                        <td class="px-4 py-3 text-[10px] space-y-0.5">
+                                            <div class="flex items-center gap-1.5">
+                                                <span class="text-gray-500 font-bold uppercase text-[9px]">Paper:</span>
+                                                <span class="text-gray-300 font-mono" x-text="formatTimeOnly(trade.paper_entry_time || trade.entry_time)"></span>
+                                            </div>
+                                            <div class="flex items-center gap-1.5">
+                                                <span class="text-gray-500 font-bold uppercase text-[9px]">Live:</span>
+                                                <span :class="trade.live_status === 'FILLED' ? 'text-emerald-400 font-mono' : (trade.live_status === 'FILLING' ? 'text-amber-400 font-mono animate-pulse' : 'text-gray-500')"
+                                                      x-text="trade.live_status === 'FILLED' ? formatTimeOnly(trade.live_entry_time) : (trade.live_status === 'FILLING' ? 'Retrying…' : (trade.live_status === 'NO_CREDS' ? 'No Key' : trade.live_status))"></span>
+                                            </div>
+                                        </td>
                                         <td class="px-4 py-3 text-right font-bold"
                                             :class="trade.awaiting_resolution ? 'text-sky-400' : 'text-yellow-500'"
-                                            :title="trade.awaiting_resolution ? 'Window ended - waiting for Polymarket to publish the result. Does not block new entries.' : 'Window still running'"
                                             x-text="trade.awaiting_resolution ? 'RESOLVING' : trade.status"></td>
                                     </tr>
                                 </template>
                                 <tr x-show="!data.trading_state?.active_trades?.length">
-                                    <td colspan="7" class="py-6 text-center text-gray-600 italic text-xs"
+                                    <td colspan="8" class="py-6 text-center text-gray-600 italic text-xs"
                                         x-text="running ? 'No active trades found. Looking for edge...' : 'Trading is STOPPED — press Start to allow entries.'"></td>
                                 </tr>
                             </tbody>
@@ -257,40 +281,66 @@
                         </button>
                     </div>
                     <div class="overflow-x-auto -mx-4 sm:mx-0">
-                        <table class="w-full text-left min-w-[500px] sm:min-w-0">
+                        <table class="w-full text-left min-w-[650px] sm:min-w-0">
                             <thead>
                                 <tr class="text-gray-500 text-xs uppercase tracking-wider">
                                     <th class="px-4 py-2">Market</th>
                                     <th class="px-4 py-2">Side</th>
-                                    <th class="px-4 py-2">Entry</th>
-                                    <th class="px-4 py-2">Opened by</th>
+                                    <th class="px-4 py-2">Entry (P / L)</th>
                                     <th class="px-4 py-2">Exit</th>
-                                    <th class="px-4 py-2">Open→Close</th>
-                                    <th class="px-4 py-2">P/L</th>
-                                    <th class="px-4 py-2">Entry Time</th>
-                                    <th class="px-4 py-2 text-right">Close Time</th>
+                                    <th class="px-4 py-2">Live P/L</th>
+                                    <th class="px-4 py-2">Opened</th>
+                                    <th class="px-4 py-2">Closed</th>
+                                    <th class="px-4 py-2 text-right">Result</th>
                                 </tr>
                             </thead>
                             <tbody class="text-[11px] sm:text-sm">
-                                <template x-for="trade in tradeHistory" :key="trade.entry_time">
+                                <template x-for="trade in tradeHistory" :key="trade.trade_id || trade.paper_entry_time || trade.entry_time">
                                     <tr class="border-t border-gray-700 hover:bg-gray-700/30 transition">
-                                        <td class="px-4 py-3 truncate max-w-[150px] sm:max-w-[200px]" x-text="trade.market_slug"></td>
+                                        <td class="px-4 py-3 truncate max-w-[150px] sm:max-w-[180px]" x-text="trade.market_slug"></td>
                                         <td class="px-4 py-3 font-bold" :class="trade.side === 'UP' ? 'text-green-400' : 'text-red-400'" x-text="trade.side"></td>
-                                        <td class="px-4 py-3 font-mono" x-text="(trade.entry_price * 100).toFixed(0) + '¢'"></td>
-                                        <td class="px-4 py-3 font-mono font-bold" :class="trade.open_reason === 'flip_entry' ? 'text-orange-400' : 'text-blue-400'" x-text="trade.open_reason === 'flip_entry' ? 'FLIP' : 'EV'"></td>
+                                        <td class="px-4 py-3 font-mono text-gray-300">
+                                            <span x-text="trade.paper_entry_price != null ? ((trade.paper_entry_price * 100).toFixed(0) + '¢') : ((trade.entry_price * 100).toFixed(0) + '¢')"></span>
+                                            <span class="text-gray-500">/</span>
+                                            <span :class="trade.live_entry_price != null ? 'text-emerald-400 font-bold' : 'text-gray-500'"
+                                                  x-text="trade.live_entry_price != null ? ((trade.live_entry_price * 100).toFixed(0) + '¢') : '—'"></span>
+                                        </td>
                                         <td class="px-4 py-3 font-mono font-bold"
                                             :class="trade.exit_reason === 'flip' ? 'text-orange-400' : ((trade.status === 'VOID' || trade.exit_reason === 'void') ? 'text-gray-500' : 'text-teal-400')"
                                             x-text="trade.exit_reason ? trade.exit_reason.toUpperCase() : (trade.status === 'VOID' ? 'VOID' : 'SETTLED')"></td>
-                                        <td class="px-4 py-3 font-mono text-[10px]"
-                                            :class="(trade.open_price != null && trade.close_price != null) ? (trade.close_price >= trade.open_price ? 'text-green-400' : 'text-red-400') : 'text-gray-500'"
-                                            x-text="(trade.open_price != null && trade.close_price != null) ? (Math.round(trade.open_price).toLocaleString() + '→' + Math.round(trade.close_price).toLocaleString() + (trade.close_price >= trade.open_price ? ' ↑' : ' ↓')) : '—'"></td>
-                                        <td class="px-4 py-3 font-bold font-mono" :class="trade.profit_loss > 0 ? 'text-green-400' : 'text-red-400'" x-text="(trade.profit_loss > 0 ? '+$' : '-$') + Math.abs(trade.profit_loss).toFixed(2)"></td>
-                                        <td class="px-4 py-3 text-gray-400 text-[10px] whitespace-nowrap" x-text="trade.entry_time ? new Date(trade.entry_time).toLocaleString() : '—'"></td>
-                                        <td class="px-4 py-3 text-right text-gray-500 text-[10px] whitespace-nowrap" x-text="trade.exit_time ? new Date(trade.exit_time).toLocaleString() : '—'"></td>
+                                        <td class="px-4 py-3 font-bold font-mono">
+                                            <span x-show="trade.live_profit_loss != null"
+                                                  :class="trade.live_profit_loss > 0 ? 'text-green-400' : (trade.live_profit_loss < 0 ? 'text-red-400' : 'text-gray-400')"
+                                                  x-text="trade.live_profit_loss != null ? ((trade.live_profit_loss >= 0 ? '+$' : '-$') + Math.abs(trade.live_profit_loss).toFixed(2)) : ''"></span>
+                                            <span x-show="trade.live_profit_loss == null" class="text-gray-500">—</span>
+                                        </td>
+                                        <td class="px-4 py-3 text-[10px] space-y-0.5 whitespace-nowrap">
+                                            <div class="text-gray-300 font-mono">
+                                                <span class="text-gray-500 font-bold uppercase text-[9px]">P:</span>
+                                                <span x-text="formatTimeOnly(trade.paper_entry_time || trade.entry_time)"></span>
+                                            </div>
+                                            <div class="font-mono" :class="trade.live_entry_time ? 'text-emerald-400' : 'text-gray-500'">
+                                                <span class="text-gray-500 font-bold uppercase text-[9px]">L:</span>
+                                                <span x-text="trade.live_entry_time ? formatTimeOnly(trade.live_entry_time) : '—'"></span>
+                                            </div>
+                                        </td>
+                                        <td class="px-4 py-3 text-[10px] space-y-0.5 whitespace-nowrap">
+                                            <div class="text-gray-300 font-mono">
+                                                <span class="text-gray-500 font-bold uppercase text-[9px]">P:</span>
+                                                <span x-text="formatTimeOnly(trade.paper_closed_time || trade.exit_time)"></span>
+                                            </div>
+                                            <div class="font-mono" :class="trade.live_closed_time ? 'text-emerald-400' : 'text-gray-500'">
+                                                <span class="text-gray-500 font-bold uppercase text-[9px]">L:</span>
+                                                <span x-text="trade.live_closed_time ? formatTimeOnly(trade.live_closed_time) : '—'"></span>
+                                            </div>
+                                        </td>
+                                        <td class="px-4 py-3 text-right text-xs uppercase font-bold"
+                                            :class="trade.status === 'VOID' ? 'text-gray-500' : (trade.winning_outcome ? 'text-sky-400' : 'text-gray-400')"
+                                            x-text="trade.winning_outcome ? (trade.winning_outcome + ' WIN') : (trade.resolution || trade.status)"></td>
                                     </tr>
                                 </template>
                                 <tr x-show="!tradeHistory.length">
-                                    <td colspan="9" class="py-6 text-center text-gray-600 italic text-xs">No closed trades yet.</td>
+                                    <td colspan="8" class="py-6 text-center text-gray-600 italic text-xs">No closed trades yet.</td>
                                 </tr>
                             </tbody>
                         </table>
@@ -486,10 +536,13 @@
                     } catch (e) { /* fall back to what is loaded */ }
                     if (!rows || !rows.length) return;
 
-                    const cols = ['market_slug', 'market_id', 'side', 'opened_by', 'entry_price',
-                                  'amount_usd', 'shares', 'exit', 'open_price', 'close_price',
-                                  'profit_loss', 'resolution', 'strike_source', 'mode',
-                                  'entry_time', 'close_time', 'redeem_status'];
+                    const cols = ['market_slug', 'market_id', 'side', 'opened_by',
+                                  'paper_entry_price', 'live_entry_price',
+                                  'paper_amount_usd', 'live_amount_usd', 'live_shares',
+                                  'exit', 'open_price', 'close_price',
+                                  'paper_profit_loss', 'live_profit_loss', 'resolution',
+                                  'paper_opened', 'live_opened', 'paper_closed', 'live_closed',
+                                  'copy_status', 'redeem_status'];
                     const esc = (v) => {
                         if (v === null || v === undefined) return '';
                         const t = String(v);
@@ -497,11 +550,23 @@
                     };
                     const line = (t) => [
                         t.market_slug, t.market_id, t.side,
-                        t.open_reason === 'flip_entry' ? 'FLIP' : 'EV', t.entry_price,
-                        t.amount, t.shares,
+                        t.open_reason === 'flip_entry' ? 'FLIP' : 'EV',
+                        t.paper_entry_price ?? t.entry_price,
+                        t.live_entry_price ?? '',
+                        t.amount,
+                        t.live_amount ?? '',
+                        t.live_shares ?? (t.shares || ''),
                         t.exit_reason ? t.exit_reason.toUpperCase() : (t.status === 'VOID' ? 'VOID' : 'SETTLED'),
-                        t.open_price, t.close_price, t.profit_loss, t.resolution,
-                        t.strike_source, t.mode, t.entry_time, t.exit_time, t.redeem_status
+                        t.open_price, t.close_price,
+                        t.paper_profit_loss ?? t.profit_loss,
+                        t.live_profit_loss ?? '',
+                        t.resolution,
+                        t.paper_entry_time || t.entry_time,
+                        t.live_entry_time || '',
+                        t.paper_exit_time || t.exit_time,
+                        t.live_exit_time || '',
+                        t.copy_status || '',
+                        t.redeem_status
                     ].map(esc).join(',');
 
                     const csv = [cols.join(','), ...rows.map(line)].join(EOL) + EOL;
@@ -533,6 +598,14 @@
                     const m = Math.floor(totalSecs / 60);
                     const s = totalSecs % 60;
                     return m.toString().padStart(2, '0') + ':' + s.toString().padStart(2, '0');
+                },
+                formatTimeOnly(iso) {
+                    if (!iso) return '—';
+                    try {
+                        const d = new Date(iso);
+                        if (isNaN(d.getTime())) return iso;
+                        return d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+                    } catch (e) { return iso; }
                 }
             }
         }

@@ -26,3 +26,5 @@ aiofiles==25.1.0
 gunicorn==23.0.0
 polymarket-apis==2.3.0
 eth-account==0.13.7
+orjson>=3.10.0
+coincurve>=20.0.0
