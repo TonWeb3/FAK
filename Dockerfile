@@ -20,11 +20,11 @@ RUN pip install --no-cache-dir --upgrade pip \
 COPY . .
 
 # Environment variables
-ENV PORT=8000
+ENV PORT=8080
 ENV SYMBOL=BTCUSDT
 ENV POLL_INTERVAL_MS=1000
 
-EXPOSE 8000
+EXPOSE 8080
 
 # Gunicorn with a uvicorn worker. Exec form (JSON) so the process receives SIGTERM
 # directly and shuts the websockets down cleanly; `sh -c` is still needed to expand

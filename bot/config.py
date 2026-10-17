@@ -23,7 +23,7 @@ class Settings(BaseSettings):
     # safe — whichever actually holds pUSD. Nothing to pick by hand.
     CLOB_MAX_SLIPPAGE: float = 0.05  # marketable-limit buffer above the quote (probability units, 5¢)
     EXIT_MAX_RETRIES: int = 3
-    CLOB_ALLOW_PARTIAL_FILL: bool = True  # FOK with FAK fallback for thin books
+    CLOB_ALLOW_PARTIAL_FILL: bool = True  # Strictly FAK (Fill-And-Kill execution)
     RELAYER_API_KEY: str = ""        # Polymarket relayer API key (sponsors gasless on-chain setup)
     ALCHEMY_API_KEY: str = ""        # optional: dedicated Polygon RPC for chain reads
 

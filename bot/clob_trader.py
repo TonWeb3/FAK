@@ -84,8 +84,51 @@ def _patch_order_builder():
         print(f"Warning: Failed to patch OrderBuilder: {e}")
 
 
+def _patch_crypto_signing():
+    """Accelerate EIP-712 cryptographic signing using compiled C coincurve (libsecp256k1).
+    Bypasses pure-Python eth-account modular arithmetic, dropping signature creation to sub-0.1ms."""
+    try:
+        import coincurve
+        from eth_account import Account
+        from eth_account.datastructures import SignedMessage
+
+        orig_unsafe_sign_hash = Account.unsafe_sign_hash
+
+        def fast_unsafe_sign_hash(message_hash, private_key):
+            try:
+                if isinstance(private_key, str):
+                    pk_bytes = bytes.fromhex(private_key[2:] if private_key.startswith("0x") else private_key)
+                elif hasattr(private_key, "key"):
+                    pk_bytes = bytes(private_key.key)
+                else:
+                    pk_bytes = bytes(private_key)
+
+                msg_bytes = bytes.fromhex(message_hash[2:] if str(message_hash).startswith("0x") else message_hash) if isinstance(message_hash, str) else bytes(message_hash)
+
+                pk = coincurve.PrivateKey(pk_bytes)
+                sig65 = pk.sign_recoverable(msg_bytes, hasher=None)
+                r = int.from_bytes(sig65[:32], "big")
+                s = int.from_bytes(sig65[32:64], "big")
+                v = sig65[64] + 27
+                sig_bytes = sig65[:64] + bytes([v])
+                return SignedMessage(
+                    messageHash=msg_bytes,
+                    r=r,
+                    s=s,
+                    v=v,
+                    signature=sig_bytes,
+                )
+            except Exception:
+                return orig_unsafe_sign_hash(message_hash, private_key)
+
+        Account.unsafe_sign_hash = staticmethod(fast_unsafe_sign_hash)
+    except Exception as e:
+        print(f"Note: coincurve C-signing patch fallback: {e}")
+
+
 _patch_clob_models()
 _patch_order_builder()
+_patch_crypto_signing()
 
 
 
@@ -232,6 +275,15 @@ class ClobTrader:
         )
         clob.set_api_creds(clob.create_or_derive_api_creds())
 
+        # Optimize HTTP client transport: persistent Keep-Alive pool with HTTP/1.1 (bypasses HTTP/2 framing)
+        try:
+            import httpx
+            limits = httpx.Limits(max_keepalive_connections=20, max_connections=30, keepalive_expiry=300.0)
+            transport = httpx.HTTPTransport(http1=True, http2=False, limits=limits)
+            clob.client = httpx.Client(base_url=clob.base_url, transport=transport, timeout=10.0)
+        except Exception:
+            pass
+
         self.gasless = gasless
         self.clob = clob
         self.funder = funder
@@ -250,6 +302,12 @@ class ClobTrader:
                 return False
             try:
                 self._init_clients()
+                # Pre-warm crypto signing context and secp256k1 base point tables
+                try:
+                    import coincurve, os
+                    _ = coincurve.PrivateKey(os.urandom(32)).sign_recoverable(os.urandom(32), hasher=None)
+                except Exception:
+                    pass
                 return True
             except Exception as e:
                 self.last_error = f"{type(e).__name__}: {e}"

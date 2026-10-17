@@ -4,6 +4,7 @@ from typing import Optional, Callable, Dict, List
 import aiohttp
 from .config import settings
 from .net_utils import get_proxy_url_for
+from .indicators import ChainlinkTwapTracker
 
 # ── Low-Level Performance: Fast JSON Acceleration (orjson / std json fallback) ──
 try:
@@ -46,7 +47,7 @@ class BinanceTradeStream:
             try:
                 proxy = get_proxy_url_for(url)
                 async with aiohttp.ClientSession() as session:
-                    async with session.ws_connect(url, proxy=proxy if proxy else None) as ws:
+                    async with session.ws_connect(url, compress=0, proxy=proxy if proxy else None) as ws:
                         print(f"Connected to Binance Futures Lead WS: {self.symbol}@bookTicker")
                         while not self.closed:
                             msg = await ws.receive()
@@ -88,7 +89,7 @@ class BinanceTradeStream:
             try:
                 proxy = get_proxy_url_for(url)
                 async with aiohttp.ClientSession() as session:
-                    async with session.ws_connect(url, proxy=proxy if proxy else None) as ws:
+                    async with session.ws_connect(url, compress=0, proxy=proxy if proxy else None) as ws:
                         print(f"Connected to Binance Spot WS ({url}): {self.symbol}")
                         while not self.closed:
                             msg = await ws.receive()
@@ -156,7 +157,7 @@ class BinanceKlineStream:
             try:
                 proxy = get_proxy_url_for(url)
                 async with aiohttp.ClientSession() as session:
-                    async with session.ws_connect(url, proxy=proxy if proxy else None) as ws:
+                    async with session.ws_connect(url, compress=0, proxy=proxy if proxy else None) as ws:
                         print(f"Connected to Binance Kline WS ({url}): {self.symbol} {self.interval}")
                         while not self.closed:
                             msg = await ws.receive()
@@ -210,6 +211,7 @@ class PolymarketChainlinkStream:
         self.on_update = on_update
         self.last_price = None
         self.last_updated_at = None
+        self.twap_tracker = ChainlinkTwapTracker(60.0)
         self.closed = False
 
     async def start(self):
@@ -232,7 +234,7 @@ class PolymarketChainlinkStream:
                 }
                 async with aiohttp.ClientSession(headers=headers) as session:
                     print(f"Connecting to Polymarket WS: {self.ws_url}")
-                    async with session.ws_connect(self.ws_url, proxy=proxy if proxy else None) as ws:
+                    async with session.ws_connect(self.ws_url, compress=0, proxy=proxy if proxy else None) as ws:
                         print(f"Connected to Polymarket WS. Subscribing to topics...")
 
                         topics = ["crypto_prices_chainlink", "price_chainlink", "settlement_prices"]
@@ -283,6 +285,7 @@ class PolymarketChainlinkStream:
                                             updated_at = float(ts_val)
                                             if updated_at < 10000000000: updated_at *= 1000
                                             self.last_updated_at = updated_at
+                                            self.twap_tracker.add_tick(self.last_price, self.last_updated_at)
 
                                             if self.on_update:
                                                 res = self.on_update({"price": self.last_price, "updatedAt": self.last_updated_at, "source": "polymarket_ws"})
@@ -298,8 +301,11 @@ class PolymarketChainlinkStream:
                 if not self.closed:
                     await asyncio.sleep(2)
 
+    def get_twap(self) -> Optional[float]:
+        return self.twap_tracker.get_twap()
+
     def get_last(self):
-        return {"price": self.last_price, "updatedAt": self.last_updated_at, "source": "polymarket_ws"}
+        return {"price": self.last_price, "updatedAt": self.last_updated_at, "twap": self.twap_tracker.get_twap(), "source": "polymarket_ws"}
 
     def close(self):
         self.closed = True
@@ -342,7 +348,7 @@ class PolymarketClobMarketStream:
             try:
                 proxy = get_proxy_url_for(self.ws_url)
                 async with aiohttp.ClientSession() as session:
-                    async with session.ws_connect(self.ws_url, proxy=proxy if proxy else None) as ws:
+                    async with session.ws_connect(self.ws_url, compress=0, proxy=proxy if proxy else None) as ws:
                         self._ws = ws
                         print(f"Connected to Polymarket CLOB Market WS: {self.ws_url}")
                         await self._subscribe(ws)
@@ -563,6 +569,7 @@ class ChainlinkPriceStream:
         self.on_update = on_update
         self.last_price = None
         self.last_updated_at = None
+        self.twap_tracker = ChainlinkTwapTracker(60.0)
         self.closed = False
         self.wss_urls = settings.POLYGON_WSS_URLS + ([settings.POLYGON_WSS_URL] if settings.POLYGON_WSS_URL else [])
 
@@ -577,7 +584,7 @@ class ChainlinkPriceStream:
             try:
                 proxy = get_proxy_url_for(url)
                 async with aiohttp.ClientSession() as session:
-                    async with session.ws_connect(url, proxy=proxy if proxy else None) as ws:
+                    async with session.ws_connect(url, compress=0, proxy=proxy if proxy else None) as ws:
                         print(f"Connected to Chainlink RPC WS: {url}")
                         sub_msg = {
                             "jsonrpc": "2.0",
@@ -609,6 +616,9 @@ class ChainlinkPriceStream:
                                         data_hex = log.get("data", "0x")
                                         if len(data_hex) >= 66:
                                             self.last_updated_at = int(data_hex[2:66], 16) * 1000
+                                        else:
+                                            self.last_updated_at = int(time.time() * 1000)
+                                        self.twap_tracker.add_tick(self.last_price, self.last_updated_at)
 
                                         if self.on_update:
                                             res = self.on_update({"price": self.last_price, "updatedAt": self.last_updated_at, "source": "chainlink_ws"})
@@ -621,8 +631,11 @@ class ChainlinkPriceStream:
                 if not self.closed:
                     await asyncio.sleep(2)
 
+    def get_twap(self) -> Optional[float]:
+        return self.twap_tracker.get_twap()
+
     def get_last(self):
-        return {"price": self.last_price, "updatedAt": self.last_updated_at, "source": "chainlink_ws"}
+        return {"price": self.last_price, "updatedAt": self.last_updated_at, "twap": self.twap_tracker.get_twap(), "source": "chainlink_ws"}
 
     def close(self):
         self.closed = True

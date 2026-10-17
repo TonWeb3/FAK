@@ -822,7 +822,8 @@ async def maybe_flip_position(decision: Dict[str, Any], poly_snapshot: Dict[str,
 
 def mark_window_open(start_ms: int, window_ms: int, current_price: Optional[float],
                       spot_price: Optional[float], price_source: Optional[str],
-                      price_is_fresh: bool = True) -> Dict[str, Any]:
+                      price_is_fresh: bool = True,
+                      twap_price: Optional[float] = None) -> Dict[str, Any]:
     opens = state["market_opens"]
     prev_ws = state.get("last_window_start")
 
@@ -843,13 +844,15 @@ def mark_window_open(start_ms: int, window_ms: int, current_price: Optional[floa
 
     win = opens[start_ms]
     since_start = time.time() * 1000 - start_ms
-    if (win["chainlink"] is None and current_price and price_is_fresh
+    effective_open = twap_price or current_price
+    if (win["chainlink"] is None and effective_open and price_is_fresh
             and 0 <= since_start < MARK_CAPTURE_WINDOW_MS):
-        win["chainlink"] = current_price
+        win["chainlink"] = effective_open
         win["binance"] = spot_price
         win["genuine"] = True
-        log_message(f"Window open marked @ eventStartTime: Chainlink {current_price:.2f} "
-                    f"({price_source}) / Binance {spot_price if spot_price else '-'}")
+        src_tag = f"TWAP({price_source})" if twap_price else price_source
+        log_message(f"Window open marked @ eventStartTime: Chainlink {effective_open:.2f} "
+                    f"({src_tag}) / Binance {spot_price if spot_price else '-'}")
     state["last_window_start"] = start_ms
     return win
 
@@ -967,9 +970,11 @@ async def update_trades(current_prices: Dict[str, Any]):
                 remaining_active.append(trade)
                 continue
             if strike and settlement_price:
-                trade["settlement_price_at_expiry"] = settlement_price
-                winning_index = up_index if settlement_price > strike else down_index
-                resolution = "close_vs_open"
+                twap_settle = current_prices.get("chainlink_twap")
+                effective_settle = twap_settle or settlement_price
+                trade["settlement_price_at_expiry"] = effective_settle
+                winning_index = up_index if effective_settle > strike else down_index
+                resolution = "close_vs_open_twap" if twap_settle else "close_vs_open"
                 trade["settle_wait_s"] = round(waited, 1)
 
         if winning_index == -1:
@@ -1065,6 +1070,9 @@ async def update_trades(current_prices: Dict[str, Any]):
     if trades_changed:
         save_state()
         _sync_active_trades_to_latest_data()
+        # Controlled GC invocation: cleanup expired trade objects during quiet settlement period
+        import gc
+        gc.collect()
 
 # ── Capital Extractor (Auto-Withdrawal State Machine) ─────────────────────────
 async def maybe_auto_withdraw(equity: float, poly_snapshot: Dict[str, Any]):
@@ -1367,10 +1375,11 @@ async def update_loop():
                 event_start_ms = int(timing["startMs"])
 
             start_ms = event_start_ms
-            win = mark_window_open(start_ms, window_ms, current_price, spot_price, price_source, price_is_fresh=price_is_fresh)
+            cl_twap = poly_ws.get("twap") or cl_ws.get("twap")
+            win = mark_window_open(start_ms, window_ms, current_price, spot_price, price_source, price_is_fresh=price_is_fresh, twap_price=cl_twap)
 
             strike_open = win["chainlink"]
-            strike_source = "chainlink_ws"
+            strike_source = "chainlink_twap" if (win.get("genuine") and cl_twap) else "chainlink_ws"
 
             model_open = None
             for c in reversed(klines_5m):
@@ -1480,7 +1489,7 @@ async def update_loop():
                     "slot_busy": bool(state["active_trades"]),
                 }
 
-            current_prices_dict = {"spot": spot_price, "chainlink": current_price}
+            current_prices_dict = {"spot": spot_price, "chainlink": current_price, "chainlink_twap": cl_twap}
 
             exec_result = None
             if poly_snapshot["ok"] and state["running"] and state["withdraw_state"] != "in_progress":
@@ -1599,6 +1608,18 @@ async def lifespan(app: FastAPI):
                 log_message(f"Startup on-chain wallet verification: {setup_res}")
             except Exception as e:
                 log_message(f"Startup on-chain wallet verification note: {e}")
+
+    # ── High-Performance Memory & Garbage Collection Optimization ──
+    # Collect all startup allocations and freeze existing long-lived objects in gen 2,
+    # so GC never traverses imported modules, compiled regexes, or initial state objects.
+    # Raise gen 0 threshold to 50,000 to prevent GC pauses during sub-millisecond tick bursts.
+    import gc
+    gc.collect()
+    try:
+        gc.freeze()
+    except Exception:
+        pass
+    gc.set_threshold(50_000, 10, 10)
 
     tasks = [
         asyncio.create_task(binance_stream.start()),
@@ -2183,4 +2204,5 @@ async def get_history():
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8080)
+    port = int(os.getenv("PORT", 8080))
+    uvicorn.run(app, host="0.0.0.0", port=port)
