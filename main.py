@@ -40,8 +40,8 @@ TELEGRAM_SUBS_PATH = "telegram_subscribers.json"
 _ws_clients = set()
 
 # ── Event-driven early entries & wakeups ───────────────────────────────────────
-MIN_EVAL_INTERVAL_S = 0.02  # Ultra-fast 20ms evaluation interval on rapid tick bursts
-CTX_MAX_AGE_S = 30.0        # Decoupled from 1-second REST poll loop
+MIN_EVAL_INTERVAL_S = 0.25  # Evaluates up to 4 times per second (from TOG-main)
+CTX_MAX_AGE_S = 4.0        # 4.0s context validity from TOG-main
 POLY_WS_MAX_AGE_MS = 2500
 MARK_CAPTURE_WINDOW_MS = 20_000
 
@@ -349,7 +349,7 @@ polymarket_ws_stream = ws_data.PolymarketChainlinkStream(
     ws_url=settings.POLYMARKET_LIVE_DATA_WS_URL,
     symbol_includes=get_ws_symbol_filter(settings.SYMBOL)
 )
-polymarket_clob_ws = ws_data.PolymarketClobMarketStream(on_update=_wake_entry)
+polymarket_clob_ws = ws_data.PolymarketClobMarketStream()
 chainlink_ws_stream = ws_data.ChainlinkPriceStream(aggregator=settings.get_aggregator(settings.SYMBOL))
 
 def get_candle_window_timing(window_minutes: int) -> Dict[str, float]:
@@ -368,20 +368,52 @@ def get_candle_window_timing(window_minutes: int) -> Dict[str, float]:
         "remainingMinutes": remaining_ms / 60_000
     }
 
-async def fetch_polymarket_snapshot() -> Dict[str, Any]:
+_cached_market = None
+_cached_market_ts = 0.0
+_cached_market_series = ""
+
+async def get_active_market(force: bool = False) -> Optional[Dict[str, Any]]:
+    global _cached_market, _cached_market_ts, _cached_market_series
+    now = time.time()
+    curr_target = settings.POLYMARKET_SLUG or settings.POLYMARKET_SERIES_ID
+    if not force and _cached_market and _cached_market_series == curr_target:
+        end_date = _cached_market.get("endDate")
+        if end_date:
+            try:
+                end_ts = datetime.fromisoformat(end_date.replace('Z', '+00:00')).timestamp()
+                if end_ts > now + 15 and (now - _cached_market_ts) < 30.0:
+                    return _cached_market
+            except Exception:
+                pass
+        elif (now - _cached_market_ts) < 30.0:
+            return _cached_market
+
     market = None
-    if settings.POLYMARKET_SLUG:
-        market = await data.fetch_market_by_slug(settings.POLYMARKET_SLUG)
-    elif settings.POLYMARKET_AUTO_SELECT_LATEST:
-        events = await data.fetch_live_events_by_series_id(settings.POLYMARKET_SERIES_ID)
-        markets = data.flatten_event_markets(events)
+    try:
+        if settings.POLYMARKET_SLUG:
+            market = await data.fetch_market_by_slug(settings.POLYMARKET_SLUG)
+        elif settings.POLYMARKET_AUTO_SELECT_LATEST:
+            events = await data.fetch_live_events_by_series_id(settings.POLYMARKET_SERIES_ID)
+            markets = data.flatten_event_markets(events)
+            now_ms = now * 1000
+            live_markets = [
+                m for m in markets
+                if m.get("endDate") and datetime.fromisoformat(m["endDate"].replace('Z', '+00:00')).timestamp() * 1000 > now_ms
+            ]
+            if live_markets:
+                live_markets.sort(key=lambda x: x["endDate"])
+                market = live_markets[0]
+    except Exception as e:
+        print(f"Warning: Market discovery error: {e}")
 
-        now = time.time() * 1000
-        live_markets = [m for m in markets if m.get("endDate") and datetime.fromisoformat(m["endDate"].replace('Z', '+00:00')).timestamp() * 1000 > now]
-        if live_markets:
-            live_markets.sort(key=lambda x: x["endDate"])
-            market = live_markets[0]
+    if market:
+        _cached_market = market
+        _cached_market_ts = now
+        _cached_market_series = curr_target
+    return _cached_market
 
+async def fetch_polymarket_snapshot() -> Dict[str, Any]:
+    market = await get_active_market()
     if not market:
         return {"ok": False, "reason": "market_not_found"}
 
@@ -463,6 +495,18 @@ async def fetch_polymarket_snapshot() -> Dict[str, Any]:
 
     # Track whether the book data came from WS or REST
     book_source = "ws" if ((up_ws.get("bids") or up_ws.get("asks")) and (down_ws.get("bids") or down_ws.get("asks"))) else "rest"
+    # Smooth out prices with previous valid state to prevent visual glitching if a poll momentarily drops
+    final_up = up_buy if up_buy is not None else gamma_yes
+    final_down = down_buy if down_buy is not None else gamma_no
+    if final_up is not None:
+        state["last_poly_up"] = final_up
+    else:
+        final_up = state.get("last_poly_up")
+
+    if final_down is not None:
+        state["last_poly_down"] = final_down
+    else:
+        final_down = state.get("last_poly_down")
 
     # Pre-warm active market tokens in CLOB client so order creation executes in <10ms
     if settings.PRIVATE_KEY:
@@ -475,8 +519,8 @@ async def fetch_polymarket_snapshot() -> Dict[str, Any]:
         "ok": True,
         "market": market,
         "prices": {
-            "up": up_buy if up_buy is not None else gamma_yes,
-            "down": down_buy if down_buy is not None else gamma_no
+            "up": final_up,
+            "down": final_down
         },
         "token_ids": {
             "up": up_token_id,
@@ -492,115 +536,132 @@ async def fetch_polymarket_snapshot() -> Dict[str, Any]:
 async def _continuous_live_copy_fill(trade: Dict[str, Any], market: Dict[str, Any], token_ids: Dict[str, Any], evaluated_price: Optional[float] = None):
     token_id = trade.get("token_id")
     side = trade.get("side")
+    cur_mkt_id = str(market.get("id") or "")
+    cur_slug = str(market.get("slug") or "")
+
     if not token_id:
         trade["live_status"] = "FAILED"
         log_message(f"LIVE copy aborted: missing token_id for side {side}")
+        _in_flight_markets.discard(cur_mkt_id)
+        _in_flight_markets.discard(cur_slug)
         return
 
     log_message(f"LIVE copy started for {trade['market_slug']} ({side}) — continuous FAK fill loop initiated")
     retry_interval = max(0.05, min(0.20, settings.COPY_RETRY_INTERVAL_MS / 1000.0))
+    max_attempts = 2
 
-    while trade["status"] == "OPEN" and trade.get("live_status") == "FILLING":
-        now_ts = time.time()
-        # 1. Check if window is close to expiry (<15s)
-        if trade.get("end_ts") and (trade["end_ts"] - now_ts) < settings.COPY_MIN_REMAINING_S:
-            trade["live_status"] = "TIMEOUT"
-            log_message(f"LIVE copy stopped for {trade['market_slug']}: window close to expiry (<{settings.COPY_MIN_REMAINING_S}s)")
-            await asyncio.to_thread(save_state)
-            _sync_active_trades_to_latest_data()
-            await broadcast_state()
-            break
+    try:
+        while trade["status"] == "OPEN" and trade.get("live_status") == "FILLING":
+            now_ts = time.time()
+            # 1. Check if window is close to expiry (<15s)
+            if trade.get("end_ts") and (trade["end_ts"] - now_ts) < settings.COPY_MIN_REMAINING_S:
+                trade["live_status"] = "TIMEOUT"
+                log_message(f"LIVE copy stopped for {trade['market_slug']}: window close to expiry (<{settings.COPY_MIN_REMAINING_S}s)")
+                await asyncio.to_thread(save_state)
+                _sync_active_trades_to_latest_data()
+                await broadcast_state()
+                break
 
-        attempt_num = trade.get("live_attempts", 0) + 1
-        trade["live_attempts"] = attempt_num
+            attempt_num = trade.get("live_attempts", 0) + 1
+            trade["live_attempts"] = attempt_num
 
-        # 2. Get freshest book ask for this token (attempt #1 uses evaluated_price instantly with 0ms RAM lookup)
-        if attempt_num == 1 and evaluated_price and evaluated_price > 0:
-            current_ask = evaluated_price
-        else:
-            summary = polymarket_clob_ws.get_summary(token_id, max_age_s=3.0)
-            current_ask = summary.get("bestAsk") if summary else None
-            if not current_ask or current_ask <= 0:
-                current_ask = evaluated_price or trade.get("paper_entry_price") or 0.50
+            if attempt_num > max_attempts:
+                trade["live_status"] = "TIMEOUT"
+                log_message(f"LIVE copy max attempts reached ({max_attempts}) for {trade['market_slug']} — halting to prevent duplicate orders")
+                await asyncio.to_thread(save_state)
+                _sync_active_trades_to_latest_data()
+                await broadcast_state()
+                break
 
-        # 3. Sizing: Instant RAM lookup of precomputed stake from background updater (0ms latency)
-        live_balance = state.get("live_balance") or 0.0
-        live_amount = state.get("precomputed_live_stake") or 0.0
-
-        # Safety fallback if background updater hasn't populated yet
-        if live_balance <= 0 or live_amount <= 0:
-            live_balance = await asyncio.to_thread(clob_trader.get_usdc_balance) or 0.0
-            state["live_balance"] = live_balance
-            risk_type = (settings.RISK_TYPE or "percent").lower()
-            if risk_type == "fixed":
-                live_amount = float(settings.RISK_VALUE)
+            # 2. Get freshest book ask for this token (attempt #1 uses evaluated_price instantly with 0ms RAM lookup)
+            if attempt_num == 1 and evaluated_price and evaluated_price > 0:
+                current_ask = evaluated_price
             else:
-                live_amount = (float(settings.RISK_VALUE) / 100.0) * live_balance
-            live_amount = max(1.0, min(live_amount, live_balance)) if live_balance >= 1.0 else 0.0
-            state["precomputed_live_stake"] = round(live_amount, 2)
+                summary = polymarket_clob_ws.get_summary(token_id, max_age_s=3.0)
+                current_ask = summary.get("bestAsk") if summary else None
+                if not current_ask or current_ask <= 0:
+                    current_ask = evaluated_price or trade.get("paper_entry_price") or 0.50
 
-        if live_balance < 1.0 or live_amount < 1.0:
-            trade["live_status"] = "INSUFFICIENT_FUNDS"
-            log_message(f"LIVE copy halted for {trade['market_slug']}: deposit balance too low (${live_balance:.2f} < $1.00 minimum)")
-            await asyncio.to_thread(save_state)
-            _sync_active_trades_to_latest_data()
-            await broadcast_state()
-            break
+            # 3. Sizing: Instant RAM lookup of precomputed stake from background updater (0ms latency)
+            live_balance = state.get("live_balance") or 0.0
+            live_amount = state.get("precomputed_live_stake") or 0.0
 
-        # 4. Place FAK market BUY order with persistent progressive sweep
-        # On retries expand slippage (+1.5¢ per retry, up to +8¢) to guarantee immediate fill against book asks
-        extra_slip = min(0.08, (attempt_num - 1) * 0.015)
-        effective_slip = settings.CLOB_MAX_SLIPPAGE + extra_slip
-
-        res = await asyncio.to_thread(clob_trader.place_market_buy, token_id, live_amount, current_ask, slippage=effective_slip)
-
-        if res.get("ok") and res.get("fill_size"):
-            # FILLED via FAK!
-            trade["live_status"] = "FILLED"
-            fill_size = float(res["fill_size"])
-            fill_price = float(res["fill_price"])
-            fill_usd = float(res.get("fill_usd") or (fill_size * fill_price))
-            trade["live_entry_price"] = fill_price
-            trade["live_shares"] = fill_size
-            trade["live_amount"] = fill_usd
-            trade["live_entry_time"] = datetime.now().isoformat()
-            trade["live_order_id"] = res.get("order_id")
-            trade["live_quoted_price"] = current_ask
-            trade["live_slippage"] = fill_price - current_ask
-
-            # Immediately deduct spent funds in RAM so subsequent orders don't wait for chain sync
-            if fill_usd > 0:
-                new_bal = max(0.0, (state.get("live_balance") or 0.0) - fill_usd)
-                state["live_balance"] = new_bal
+            # Safety fallback if background updater hasn't populated yet
+            if live_balance <= 0 or live_amount <= 0:
+                live_balance = await asyncio.to_thread(clob_trader.get_usdc_balance) or 0.0
+                state["live_balance"] = live_balance
                 risk_type = (settings.RISK_TYPE or "percent").lower()
                 if risk_type == "fixed":
-                    new_stake = float(settings.RISK_VALUE)
+                    live_amount = float(settings.RISK_VALUE)
                 else:
-                    new_stake = (float(settings.RISK_VALUE) / 100.0) * new_bal
-                state["precomputed_live_stake"] = round(max(1.0, min(new_stake, new_bal)) if new_bal >= 1.0 else 0.0, 2)
+                    live_amount = (float(settings.RISK_VALUE) / 100.0) * live_balance
+                live_amount = max(1.0, min(live_amount, live_balance)) if live_balance >= 1.0 else 0.0
+                state["precomputed_live_stake"] = round(live_amount, 2)
 
-            save_state()
-            _sync_active_trades_to_latest_data()
-            await broadcast_state()
+            if live_balance < 1.0 or live_amount < 1.0:
+                trade["live_status"] = "INSUFFICIENT_FUNDS"
+                log_message(f"LIVE copy halted for {trade['market_slug']}: deposit balance too low (${live_balance:.2f} < $1.00 minimum)")
+                await asyncio.to_thread(save_state)
+                _sync_active_trades_to_latest_data()
+                await broadcast_state()
+                break
 
-            msg = (f"LIVE trade FILLED (attempt #{attempt_num}): {side} ${fill_usd:.2f} on {trade['market_slug']} "
-                   f"— {fill_size:.2f} shares @ {fill_price:.4f} (paper entry {trade['paper_entry_price']:.4f}, order {trade['live_order_id']})")
-            log_message(msg)
-            await send_telegram(f"🚀 *LIVE Copy FILLED (Attempt #{attempt_num})*\n• Side: `{side}`\n• Fill Price: `{fill_price:.4f}` (Paper: `{trade['paper_entry_price']:.4f}`)\n• Shares: `{fill_size:.2f}`\n• Amount: `${fill_usd:.2f}`\n• Market: `{trade['market_slug']}`")
-            return
-        else:
-            err = res.get("error", "unfilled")
-            if "setup_failed" in str(err) or "client_not_ready" in str(err) or "invalid_private_key" in str(err):
-                trade["live_status"] = "FAILED"
-                log_message(f"LIVE copy aborted: {err}")
+            # 4. Place FAK market BUY order with persistent progressive sweep
+            extra_slip = min(0.08, (attempt_num - 1) * 0.015)
+            effective_slip = settings.CLOB_MAX_SLIPPAGE + extra_slip
+
+            res = await asyncio.to_thread(clob_trader.place_market_buy, token_id, live_amount, current_ask, slippage=effective_slip)
+
+            if res.get("ok") and res.get("fill_size"):
+                # FILLED via FAK!
+                trade["live_status"] = "FILLED"
+                fill_size = float(res["fill_size"])
+                fill_price = float(res["fill_price"])
+                fill_usd = float(res.get("fill_usd") or (fill_size * fill_price))
+                trade["live_entry_price"] = fill_price
+                trade["live_shares"] = fill_size
+                trade["live_amount"] = fill_usd
+                trade["live_entry_time"] = datetime.now().isoformat()
+                trade["live_order_id"] = res.get("order_id")
+                trade["live_quoted_price"] = current_ask
+                trade["live_slippage"] = fill_price - current_ask
+
+                # Immediately deduct spent funds in RAM so subsequent orders don't wait for chain sync
+                if fill_usd > 0:
+                    new_bal = max(0.0, (state.get("live_balance") or 0.0) - fill_usd)
+                    state["live_balance"] = new_bal
+                    risk_type = (settings.RISK_TYPE or "percent").lower()
+                    if risk_type == "fixed":
+                        new_stake = float(settings.RISK_VALUE)
+                    else:
+                        new_stake = (float(settings.RISK_VALUE) / 100.0) * new_bal
+                    state["precomputed_live_stake"] = round(max(1.0, min(new_stake, new_bal)) if new_bal >= 1.0 else 0.0, 2)
+
                 save_state()
                 _sync_active_trades_to_latest_data()
                 await broadcast_state()
+
+                msg = (f"LIVE trade FILLED (attempt #{attempt_num}): {side} ${fill_usd:.2f} on {trade['market_slug']} "
+                       f"— {fill_size:.2f} shares @ {fill_price:.4f} (paper entry {trade['paper_entry_price']:.4f}, order {trade['live_order_id']})")
+                log_message(msg)
+                await send_telegram(f"🚀 *LIVE Copy FILLED (Attempt #{attempt_num})*\n• Side: `{side}`\n• Fill Price: `{fill_price:.4f}` (Paper: `{trade['paper_entry_price']:.4f}`)\n• Shares: `{fill_size:.2f}`\n• Amount: `${fill_usd:.2f}`\n• Market: `{trade['market_slug']}`")
                 return
+            else:
+                err = res.get("error", "unfilled")
+                if any(k in str(err) for k in ("setup_failed", "client_not_ready", "invalid_private_key", "not enough balance", "balance is not enough")):
+                    trade["live_status"] = "FAILED"
+                    log_message(f"LIVE copy aborted: {err}")
+                    save_state()
+                    _sync_active_trades_to_latest_data()
+                    await broadcast_state()
+                    return
 
-            log_message(f"LIVE copy attempt #{attempt_num} for {side} @ {current_ask:.4f} [FAK]: {err} — retrying FAK in {int(retry_interval * 1000)}ms...")
+                log_message(f"LIVE copy attempt #{attempt_num} for {side} @ {current_ask:.4f} [FAK]: {err} — retrying FAK in {int(retry_interval * 1000)}ms...")
 
-        await asyncio.sleep(retry_interval)
+            await asyncio.sleep(retry_interval)
+    finally:
+        _in_flight_markets.discard(cur_mkt_id)
+        _in_flight_markets.discard(cur_slug)
 
 
 async def execute_trade(decision: Dict[str, Any], market_prices: Dict[str, Any], market: Dict[str, Any], strike_open: Optional[float], token_ids: Dict[str, Any], orderbook: Optional[Dict[str, Any]] = None,
@@ -615,8 +676,10 @@ async def execute_trade(decision: Dict[str, Any], market_prices: Dict[str, Any],
     async with _trade_lock:
         if cur_mkt_id and cur_mkt_id in _in_flight_markets:
             return "slot_busy"
+        if cur_slug and cur_slug in _in_flight_markets:
+            return "slot_busy"
 
-        # CONSTRAINT: Only one position per market window
+        # CONSTRAINT: Only one position per market window across active trades
         for t in state["active_trades"]:
             if cur_mkt_id and str(t.get("market_id")) == cur_mkt_id:
                 return "slot_busy"
@@ -716,7 +779,10 @@ async def execute_trade(decision: Dict[str, Any], market_prices: Dict[str, Any],
 
         if cur_mkt_id:
             _in_flight_markets.add(cur_mkt_id)
+        if cur_slug:
+            _in_flight_markets.add(cur_slug)
 
+        trade_dispatched = False
         try:
             state["paper_balance"] -= paper_amount
             state["active_trades"].append(trade)
@@ -733,6 +799,7 @@ async def execute_trade(decision: Dict[str, Any], market_prices: Dict[str, Any],
 
             if settings.PRIVATE_KEY:
                 # Fire LIVE trade order and paper background tasks concurrently via asyncio.gather
+                trade_dispatched = True
                 asyncio.create_task(asyncio.gather(
                     _continuous_live_copy_fill(trade, market, token_ids, evaluated_price=price),
                     _bg_paper_post_actions()
@@ -743,8 +810,11 @@ async def execute_trade(decision: Dict[str, Any], market_prices: Dict[str, Any],
 
             return "entered"
         finally:
-            if cur_mkt_id:
-                _in_flight_markets.discard(cur_mkt_id)
+            if not trade_dispatched:
+                if cur_mkt_id:
+                    _in_flight_markets.discard(cur_mkt_id)
+                if cur_slug:
+                    _in_flight_markets.discard(cur_slug)
 
 
 async def maybe_flip_position(decision: Dict[str, Any], poly_snapshot: Dict[str, Any], time_left_min: Optional[float]):
@@ -780,30 +850,31 @@ async def maybe_flip_position(decision: Dict[str, Any], poly_snapshot: Dict[str,
         return
 
     now_iso = datetime.now().isoformat()
-    # 1. Close paper trade
-    state["paper_balance"] += trade["paper_shares"] * exit_price
-    trade["paper_close_price"] = exit_price
-    trade["paper_closed_time"] = now_iso
-    trade["paper_profit_loss"] = (trade["paper_shares"] * exit_price) - trade["paper_amount"]
 
-    # 2. Close live trade if filled, or cancel if still filling
+    # 1. Close live trade first if filled. If sell fails, ABORT flip to avoid self-hedging!
     if trade.get("live_status") == "FILLED" and trade.get("live_shares"):
         token_id = token_ids.get(held_key)
         sell_shares = float(trade["live_shares"])
         result = await asyncio.to_thread(clob_trader.place_market_sell, token_id, sell_shares, exit_price)
-        if result.get("ok"):
-            live_fill_px = float(result.get("fill_price") or exit_price)
-            trade["live_close_price"] = live_fill_px
-            trade["live_closed_time"] = now_iso
-            trade["live_exit_order_id"] = result.get("order_id")
-            trade["live_profit_loss"] = (sell_shares * live_fill_px) - float(trade.get("live_amount") or 0.0)
-            log_message(f"FLIP: Live {trade['side']} sold @ {live_fill_px:.4f} (Live P/L ${trade['live_profit_loss']:.2f})")
-        else:
-            log_message(f"FLIP: Live sell failed ({result.get('error')})")
+        if not result.get("ok"):
+            log_message(f"FLIP ABORTED: Live sell of {trade['side']} failed ({result.get('error')}) — holding position to prevent self-hedging")
+            return None
+        live_fill_px = float(result.get("fill_price") or exit_price)
+        trade["live_close_price"] = live_fill_px
+        trade["live_closed_time"] = now_iso
+        trade["live_exit_order_id"] = result.get("order_id")
+        trade["live_profit_loss"] = (sell_shares * live_fill_px) - float(trade.get("live_amount") or 0.0)
+        log_message(f"FLIP: Live {trade['side']} sold @ {live_fill_px:.4f} (Live P/L ${trade['live_profit_loss']:.2f})")
     elif trade.get("live_status") == "FILLING":
         trade["live_status"] = "CANCELLED_BY_FLIP"
         trade["live_closed_time"] = now_iso
         trade["live_profit_loss"] = 0.0
+
+    # 2. Close paper trade only after live position exit is confirmed
+    state["paper_balance"] += trade["paper_shares"] * exit_price
+    trade["paper_close_price"] = exit_price
+    trade["paper_closed_time"] = now_iso
+    trade["paper_profit_loss"] = (trade["paper_shares"] * exit_price) - trade["paper_amount"]
 
     trade["status"] = "CLOSED"
     trade["exit_reason"] = "flip"
@@ -822,8 +893,7 @@ async def maybe_flip_position(decision: Dict[str, Any], poly_snapshot: Dict[str,
 
 def mark_window_open(start_ms: int, window_ms: int, current_price: Optional[float],
                       spot_price: Optional[float], price_source: Optional[str],
-                      price_is_fresh: bool = True,
-                      twap_price: Optional[float] = None) -> Dict[str, Any]:
+                      price_is_fresh: bool = True) -> Dict[str, Any]:
     opens = state["market_opens"]
     prev_ws = state.get("last_window_start")
 
@@ -844,15 +914,13 @@ def mark_window_open(start_ms: int, window_ms: int, current_price: Optional[floa
 
     win = opens[start_ms]
     since_start = time.time() * 1000 - start_ms
-    effective_open = twap_price or current_price
-    if (win["chainlink"] is None and effective_open and price_is_fresh
+    if (win["chainlink"] is None and current_price and price_is_fresh
             and 0 <= since_start < MARK_CAPTURE_WINDOW_MS):
-        win["chainlink"] = effective_open
+        win["chainlink"] = current_price
         win["binance"] = spot_price
         win["genuine"] = True
-        src_tag = f"TWAP({price_source})" if twap_price else price_source
-        log_message(f"Window open marked @ eventStartTime: Chainlink {effective_open:.2f} "
-                    f"({src_tag}) / Binance {spot_price if spot_price else '-'}")
+        log_message(f"Window open marked @ eventStartTime: Chainlink {current_price:.2f} "
+                    f"({price_source}) / Binance {spot_price if spot_price else '-'}")
     state["last_window_start"] = start_ms
     return win
 
@@ -880,9 +948,16 @@ async def _redeem_win(trade: Dict[str, Any], market: Optional[Dict[str, Any]],
 
     trade["redeem"] = res
     if res.get("ok"):
+        trade["redeem_status"] = "CONFIRMED"
         log_message(f"REDEEM ok for {trade['market_slug']}: {amounts[idx]:.2f} live shares (tx {res.get('tx')})")
     else:
-        log_message(f"REDEEM FAILED for {trade['market_slug']}: {res.get('error')}")
+        err = str(res.get("error") or "")
+        if "401" in err or "Unauthorized" in err:
+            trade["redeem_status"] = "PENDING_RELAYER_KEY"
+            log_message(f"REDEEM PENDING for {trade['market_slug']}: 401 Unauthorized — Polymarket Relayer API Key is required for gasless redemption. Add your API key in config.json -> relayer -> api_key, or claim on polymarket.com.")
+        else:
+            trade["redeem_status"] = "FAILED"
+            log_message(f"REDEEM FAILED for {trade['market_slug']}: {err}")
 
 def _archive(trade: Dict[str, Any]) -> Dict[str, Any]:
     for k in ("_market", "_market_closed", "order_response"):
@@ -1199,13 +1274,7 @@ async def evaluate_entry(reason: str = "event"):
         if not spot_price:
             return
 
-        end_ts = ctx.get("end_ts")
-        if end_ts and end_ts > now:
-            dynamic_time_left_min = (end_ts - now) / 60.0
-        else:
-            dynamic_time_left_min = ctx.get("time_left_min", 15.0)
-
-        mc_steps = max(1, math.ceil(dynamic_time_left_min / 5))
+        mc_steps = max(1, math.ceil(ctx["time_left_min"] / 5))
         fair_up = indicators.fair_prob_up(
             spot_price, ctx["target_open"], mc_steps, ctx["sigma_5m"], drift_per_step=ctx["drift_5m"]
         )
@@ -1375,11 +1444,10 @@ async def update_loop():
                 event_start_ms = int(timing["startMs"])
 
             start_ms = event_start_ms
-            cl_twap = poly_ws.get("twap") or cl_ws.get("twap")
-            win = mark_window_open(start_ms, window_ms, current_price, spot_price, price_source, price_is_fresh=price_is_fresh, twap_price=cl_twap)
+            win = mark_window_open(start_ms, window_ms, current_price, spot_price, price_source, price_is_fresh=price_is_fresh)
 
             strike_open = win["chainlink"]
-            strike_source = "chainlink_twap" if (win.get("genuine") and cl_twap) else "chainlink_ws"
+            strike_source = "chainlink_ws"
 
             model_open = None
             for c in reversed(klines_5m):
@@ -1489,7 +1557,7 @@ async def update_loop():
                     "slot_busy": bool(state["active_trades"]),
                 }
 
-            current_prices_dict = {"spot": spot_price, "chainlink": current_price, "chainlink_twap": cl_twap}
+            current_prices_dict = {"spot": spot_price, "chainlink": current_price}
 
             exec_result = None
             if poly_snapshot["ok"] and state["running"] and state["withdraw_state"] != "in_progress":
@@ -2204,5 +2272,5 @@ async def get_history():
 
 if __name__ == "__main__":
     import uvicorn
-    port = int(os.getenv("PORT", 8084))
+    port = int(os.getenv("PORT", 8080))
     uvicorn.run(app, host="0.0.0.0", port=port)
