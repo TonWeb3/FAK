@@ -49,6 +49,7 @@ _market_event = asyncio.Event()
 _entry_lock = asyncio.Lock()
 _trade_lock = asyncio.Lock()
 _in_flight_markets = set()
+_executed_windows = set()  # Strict Lockout: never re-enter executed windows
 _last_eval_ts = 0.0
 
 def _sync_active_trades_to_latest_data():
@@ -148,6 +149,14 @@ def load_state():
                 state["last_trade_side"] = loaded.get("last_trade_side")
                 state["last_withdrawal"] = loaded.get("last_withdrawal")
                 log_message(f"State loaded from {STATE_PATH}")
+                for t in state.get("trade_history", []):
+                    if t.get("market_id"): _executed_windows.add(str(t["market_id"]))
+                    if t.get("market_slug"): _executed_windows.add(str(t["market_slug"]))
+                    if t.get("window_start_ms"): _executed_windows.add(str(t["window_start_ms"]))
+                for t in state.get("active_trades", []):
+                    if t.get("market_id"): _executed_windows.add(str(t["market_id"]))
+                    if t.get("market_slug"): _executed_windows.add(str(t["market_slug"]))
+                    if t.get("window_start_ms"): _executed_windows.add(str(t["window_start_ms"]))
     except Exception as e:
         print(f"Error loading state: {e}")
 
@@ -679,7 +688,7 @@ async def execute_trade(decision: Dict[str, Any], market_prices: Dict[str, Any],
         if cur_slug and cur_slug in _in_flight_markets:
             return "slot_busy"
 
-        # CONSTRAINT: Only one position per market window across active trades
+        # CONSTRAINT: Only one position per market window (do NOT block entering a new window while an old one resolves)
         for t in state["active_trades"]:
             if cur_mkt_id and str(t.get("market_id")) == cur_mkt_id:
                 return "slot_busy"
@@ -687,6 +696,18 @@ async def execute_trade(decision: Dict[str, Any], market_prices: Dict[str, Any],
                 return "slot_busy"
             if window_start_ms is not None and t.get("window_start_ms") == int(window_start_ms):
                 return "slot_busy"
+
+        # STRICT LOCKOUT: Never re-enter THIS window if it was already executed
+        if cur_mkt_id in _executed_windows or cur_slug in _executed_windows or (window_start_ms and str(window_start_ms) in _executed_windows):
+            return "slot_already_executed"
+
+        for t in state.get("trade_history", []):
+            if cur_slug and t.get("market_slug") == cur_slug:
+                return "slot_already_executed"
+            if cur_mkt_id and str(t.get("market_id")) == cur_mkt_id:
+                return "slot_already_executed"
+            if window_start_ms is not None and t.get("window_start_ms") == int(window_start_ms):
+                return "slot_already_executed"
 
         if state["withdraw_state"] == "in_progress":
             return "withdraw_in_progress"
@@ -714,8 +735,9 @@ async def execute_trade(decision: Dict[str, Any], market_prices: Dict[str, Any],
         ask_liq_shares = ob.get("askLiquidity")
         if ask_liq_shares is not None and price > 0:
             ask_liq_usd = ask_liq_shares * price
-            if ask_liq_usd < settings.MIN_BOOK_LIQUIDITY_USD:
-                log_message(f"Skip {side}: thin book (${ask_liq_usd:.2f} ask liquidity)")
+            min_needed = max(1.0, min(paper_amount, 5.0))
+            if ask_liq_usd < min_needed and ask_liq_usd < settings.MIN_BOOK_LIQUIDITY_USD:
+                log_message(f"Skip {side}: thin book (${ask_liq_usd:.2f} ask liquidity < ${min_needed:.2f} needed)")
                 return "thin_book"
             paper_amount = min(paper_amount, ask_liq_usd)
 
@@ -786,6 +808,9 @@ async def execute_trade(decision: Dict[str, Any], market_prices: Dict[str, Any],
         try:
             state["paper_balance"] -= paper_amount
             state["active_trades"].append(trade)
+            if cur_mkt_id: _executed_windows.add(cur_mkt_id)
+            if cur_slug: _executed_windows.add(cur_slug)
+            if window_start_ms: _executed_windows.add(str(window_start_ms))
             state["last_trade_side"] = side
             _sync_active_trades_to_latest_data()
 
@@ -991,6 +1016,52 @@ async def update_trades(current_prices: Dict[str, Any]):
             frozen_close = cur_price or trade.get("last_price")
             if frozen_close:
                 trade["close_price"] = frozen_close
+        # End-of-window wallet fill reconciliation:
+        # Before evaluating settlement, compare wallet's actual fills with bot records.
+        # This catches any ghost fills or orders that filled without local confirmation.
+        if expired and trade.get("live_status") != "FILLED" and clob_trader.is_ready() and not trade.get("_reconciled"):
+            trade["_reconciled"] = True
+            token_id = trade.get("token_id")
+            order_id = trade.get("live_order_id")
+            reconciled_fills = []
+            if order_id:
+                reconciled_fills = await asyncio.to_thread(clob_trader.get_order_fills, order_id, token_id)
+            if not reconciled_fills and token_id:
+                try:
+                    entry_str = trade.get("live_entry_time") or trade.get("paper_entry_time") or trade.get("entry_time")
+                    start_ts = datetime.fromisoformat(entry_str).timestamp()
+                except Exception:
+                    start_ts = end_ts - (settings.CANDLE_WINDOW_MINUTES * 60)
+                reconciled_fills = await asyncio.to_thread(clob_trader.get_token_fills_in_window, token_id, start_ts, end_ts)
+
+            if reconciled_fills:
+                total_shares = sum(float(f["size"]) for f in reconciled_fills)
+                total_usd = sum(float(f["size"]) * float(f["price"]) for f in reconciled_fills)
+                avg_price = total_usd / total_shares if total_shares > 0 else float(trade.get("paper_entry_price") or 0.5)
+
+                log_message(f"WALLET RECONCILIATION: Discovered {total_shares:.2f} filled shares in wallet for {trade['market_slug']} ({trade['side']}) — reconciling trade to FILLED!")
+                trade["live_status"] = "FILLED"
+                trade["live_shares"] = total_shares
+                trade["live_entry_price"] = avg_price
+                trade["live_amount"] = total_usd
+                trade["live_entry_time"] = trade.get("live_entry_time") or datetime.now().isoformat()
+
+                # Deduct spent funds in RAM
+                if total_usd > 0:
+                    new_bal = max(0.0, (state.get("live_balance") or 0.0) - total_usd)
+                    state["live_balance"] = new_bal
+                    risk_type = (settings.RISK_TYPE or "percent").lower()
+                    if risk_type == "fixed":
+                        new_stake = float(settings.RISK_VALUE)
+                    else:
+                        new_stake = (float(settings.RISK_VALUE) / 100.0) * new_bal
+                    state["precomputed_live_stake"] = round(max(1.0, min(new_stake, new_bal)) if new_bal >= 1.0 else 0.0, 2)
+
+                save_state()
+                _sync_active_trades_to_latest_data()
+                await broadcast_state()
+                trades_changed = True
+
 
         market = trade.get("_market")
         poll_every = 3.0 if expired else 30.0
@@ -1041,9 +1112,11 @@ async def update_trades(current_prices: Dict[str, Any]):
             if trade.get("expired_at") is None:
                 trade["expired_at"] = now_ts
             waited = now_ts - trade["expired_at"]
+
             if waited < settings.AUTHORITATIVE_SETTLE_WAIT_S and not market_closed:
                 remaining_active.append(trade)
                 continue
+
             if strike and settlement_price:
                 twap_settle = current_prices.get("chainlink_twap")
                 effective_settle = twap_settle or settlement_price
@@ -1051,6 +1124,7 @@ async def update_trades(current_prices: Dict[str, Any]):
                 winning_index = up_index if effective_settle > strike else down_index
                 resolution = "close_vs_open_twap" if twap_settle else "close_vs_open"
                 trade["settle_wait_s"] = round(waited, 1)
+                log_message(f"SETTLEMENT FALLBACK for {trade['market_slug']}: Polymarket resolution unavailable after {waited:.0f}s — resolved locally via {resolution} ({effective_settle:.2f} vs strike {strike:.2f})")
 
         if winning_index == -1:
             first_seen = trade.get("unresolved_since")
@@ -1240,8 +1314,34 @@ def entry_block_reason(ctx: Dict[str, Any]) -> Optional[str]:
         return "withdraw_in_progress"
     if not ctx:
         return "no_context"
-    if ctx.get("slot_busy"):
+    _mkt = ctx.get("market") or {}
+    _mid = str(_mkt.get("id") or "")
+    _mslug = str(_mkt.get("slug") or "")
+    _sms = ctx.get("start_ms")
+
+    # In-flight check for this market
+    if (_mid and _mid in _in_flight_markets) or (_mslug and _mslug in _in_flight_markets):
         return "slot_busy"
+
+    # Check if THIS specific window is already busy in active_trades
+    for t in state["active_trades"]:
+        if _mid and str(t.get("market_id")) == _mid:
+            return "slot_busy"
+        if _mslug and t.get("market_slug") == _mslug:
+            return "slot_busy"
+        if _sms is not None and t.get("window_start_ms") == int(_sms):
+            return "slot_busy"
+
+    # Strict Lockout: check if THIS specific window was already executed
+    if _mid in _executed_windows or _mslug in _executed_windows or (_sms and str(_sms) in _executed_windows):
+        return "slot_already_executed"
+    for _ht in state.get("trade_history", []):
+        if _mslug and _ht.get("market_slug") == _mslug:
+            return "slot_already_executed"
+        if _mid and str(_ht.get("market_id")) == _mid:
+            return "slot_already_executed"
+        if _sms is not None and _ht.get("window_start_ms") == int(_sms):
+            return "slot_already_executed"
     if not ctx.get("price_is_fresh"):
         return "stale_feed"
     if ctx.get("strike_open") is None:
@@ -1456,8 +1556,27 @@ async def update_loop():
                     break
                 if c["openTime"] < start_ms:
                     break
+            if not model_open:
+                for c in reversed(klines_1m):
+                    if c["openTime"] == start_ms:
+                        model_open = c["open"]
+                        break
+                    if c["openTime"] < start_ms:
+                        break
             model_open = model_open or win.get("binance")
-            target_open = model_open if strike_open is not None else None
+
+            # Zero-Miss Window Backfill:
+            # If the bot started mid-window or missed the first 20s mark,
+            # backfill strike_open from historical klines at window open timestamp
+            if strike_open is None and model_open:
+                strike_open = model_open
+                strike_source = "kline_open_backfill"
+                win["chainlink"] = model_open
+                win["binance"] = model_open
+                win["genuine"] = True
+                log_message(f"Window open backfilled from klines @ eventStartTime: {strike_open:.2f} (mid-window start)")
+
+            target_open = model_open or strike_open
 
             drift_5m, sigma_5m = indicators.realized_drift_vol(klines_5m, lookback=300)
             fair_up = indicators.fair_prob_up(spot_price or 0, target_open or 0, mc_steps, sigma_5m, drift_per_step=drift_5m or 0.0)
@@ -2272,5 +2391,5 @@ async def get_history():
 
 if __name__ == "__main__":
     import uvicorn
-    port = int(os.getenv("PORT", 8095))
+    port = int(os.getenv("PORT", 8080))
     uvicorn.run(app, host="0.0.0.0", port=port)
